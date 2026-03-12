@@ -9,6 +9,7 @@ Project Accretion starts as a local-only playable prototype, but it is intention
 
 ## Timing Model
 - Server simulation target: `256 Hz`
+- Server scheduling: absolute-time fixed-step cadence to reduce drift and make tick lateness measurable
 - Client prediction target: fixed-step simulation matched to server cadence
 - Rendering target: uncapped by default, optionally frame-capped through settings
 - Timekeeping: monotonic high-resolution clock
@@ -51,6 +52,7 @@ Rendering must never alter movement, weapon cadence, hit registration, or collis
   - fire event
   - snapshot
   - hit confirm
+- Snapshot requirement: authoritative snapshots must carry enough movement and weapon state for correct reconciliation, including grounded state and active weapon timers.
 - Future-ready constraint: keep packet types and simulation rules valid if the server later runs in a separate process or on another machine.
 
 ## Simulation Rules
@@ -84,4 +86,3 @@ Runtime telemetry is written to `telemetry/` and should remain lightweight enoug
 - Append new shipped features to the ordered list in `README.md`.
 - Update this file whenever changing build assumptions, tick rates, packet flow, simulation ownership, or render/sim boundaries.
 - Update `AGENTS.md` when a workflow becomes recurring.
-

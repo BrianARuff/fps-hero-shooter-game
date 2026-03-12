@@ -38,10 +38,10 @@ Project Accretion is a Windows-first C++ hero shooter foundation focused on comp
 10. Added a debug HUD with frame pacing, rates, correction stats, movement data, hit feedback, and optional network stress toggle.
 11. Added a settings overlay with a dedicated mouse tab, video settings, and gameplay tuning fields.
 12. Added telemetry logging for frametimes, tick jitter, and key gameplay events.
+13. Hardened the baseline for competitive correctness by carrying authoritative movement and weapon timer state in snapshots, fixing head-versus-body hit resolution, removing target-render smoothing that could mislead aim, and reducing raw-input overhead.
 
 ## Next Likely Steps
 - Add stronger lag-compensation diagnostics and configurable packet simulation.
 - Add richer dummy behaviors and aim-trainer scenarios.
 - Add projectile weapon support and hero ability scaffolding.
 - Add audio, key rebinding, and a more robust menu flow.
-

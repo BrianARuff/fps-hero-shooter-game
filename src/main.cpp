@@ -473,9 +473,12 @@ struct NetPlayerState {
     float yaw;
     float pitch;
     uint8_t crouched;
+    uint8_t on_ground;
     int32_t health;
     int32_t ammo;
     uint8_t reloading;
+    float reload_time_remaining;
+    float shot_cooldown;
 };
 
 struct NetDummyState {
@@ -744,9 +747,12 @@ void FillNetPlayerState(const PlayerState& src, NetPlayerState& dst) {
     dst.yaw = src.yaw;
     dst.pitch = src.pitch;
     dst.crouched = src.crouched ? 1 : 0;
+    dst.on_ground = src.on_ground ? 1 : 0;
     dst.health = src.health;
     dst.ammo = src.weapon.ammo;
     dst.reloading = src.weapon.reloading ? 1 : 0;
+    dst.reload_time_remaining = src.weapon.reload_time_remaining;
+    dst.shot_cooldown = src.weapon.shot_cooldown;
 }
 
 PlayerState PlayerStateFromNet(const NetPlayerState& net) {
@@ -756,9 +762,12 @@ PlayerState PlayerStateFromNet(const NetPlayerState& net) {
     state.yaw = net.yaw;
     state.pitch = net.pitch;
     state.crouched = net.crouched != 0;
+    state.on_ground = net.on_ground != 0;
     state.health = net.health;
     state.weapon.ammo = net.ammo;
     state.weapon.reloading = net.reloading != 0;
+    state.weapon.reload_time_remaining = net.reload_time_remaining;
+    state.weapon.shot_cooldown = net.shot_cooldown;
     return state;
 }
 
@@ -892,18 +901,22 @@ ShotResolution ResolveServerShot(PlayerState& state, const InputCommand& input, 
         const Aabb head = MakeDummyHeadAabb(dummy_position);
         const Aabb body = MakeDummyBodyAabb(dummy_position);
 
-        float t = 0.0f;
-        const bool hit_head = RayIntersectAabb(origin, ray_dir, head, &t);
-        const bool hit_body = RayIntersectAabb(origin, ray_dir, body, &t);
+        float head_t = 0.0f;
+        float body_t = 0.0f;
+        const bool hit_head = RayIntersectAabb(origin, ray_dir, head, &head_t);
+        const bool hit_body = RayIntersectAabb(origin, ray_dir, body, &body_t);
         if (!hit_head && !hit_body) {
             continue;
         }
+
+        const float t = hit_head && (!hit_body || head_t <= body_t) ? head_t : body_t;
+        const bool headshot = hit_head && (!hit_body || head_t <= body_t);
         if (t < best_t) {
             for (DummyState& dummy : dummies) {
                 if (dummy.id == snapshot_dummy.id) {
                     best_t = t;
                     best_dummy = &dummy;
-                    best_headshot = hit_head;
+                    best_headshot = headshot;
                     break;
                 }
             }
@@ -1006,38 +1019,41 @@ void ServerRuntime::Shutdown() {
 
 void ServerRuntime::ThreadMain() {
     const double dt = kFixedDt;
-    double last_time = NowSeconds();
-    double accumulator = 0.0;
-    double stats_time = last_time;
+    double next_tick_time = NowSeconds();
+    double stats_time = next_tick_time;
     int ticks_this_second = 0;
-    double jitter_accumulator = 0.0;
+    double lateness_accumulator = 0.0;
 
     while (running) {
-        const double now = NowSeconds();
-        const double frame_time = std::min(0.1, now - last_time);
-        last_time = now;
-        accumulator += frame_time;
-
         ProcessIncoming();
-        while (accumulator >= dt) {
-            const double pre_tick = NowSeconds();
-            Tick(pre_tick, dt);
-            accumulator -= dt;
+
+        double now = NowSeconds();
+        while (now >= next_tick_time) {
+            const double tick_lateness = std::max(0.0, now - next_tick_time);
+            Tick(next_tick_time, dt);
+            next_tick_time += dt;
             ++ticks_this_second;
-            jitter_accumulator += std::fabs((NowSeconds() - pre_tick) - dt);
+            lateness_accumulator += tick_lateness;
+            now = NowSeconds();
         }
 
         if (now - stats_time >= 1.0) {
             if (debug_stats) {
                 debug_stats->tick_rate_x100.store(static_cast<int>((ticks_this_second / (now - stats_time)) * 100.0));
-                const double jitter_ms = ticks_this_second > 0 ? (jitter_accumulator / ticks_this_second) * 1000.0 : 0.0;
+                const double jitter_ms = ticks_this_second > 0 ? (lateness_accumulator / ticks_this_second) * 1000.0 : 0.0;
                 debug_stats->jitter_us.store(static_cast<int>(jitter_ms * 1000.0));
             }
             stats_time = now;
             ticks_this_second = 0;
-            jitter_accumulator = 0.0;
+            lateness_accumulator = 0.0;
         }
-        Sleep(1);
+
+        const double sleep_seconds = next_tick_time - now;
+        if (sleep_seconds > 0.002) {
+            Sleep(static_cast<DWORD>((sleep_seconds - 0.001) * 1000.0));
+        } else {
+            SwitchToThread();
+        }
     }
 }
 
@@ -1074,6 +1090,9 @@ void ServerRuntime::ProcessIncoming() {
             input.buttons = packet->buttons;
             std::lock_guard<std::mutex> lock(input_mutex);
             input_queue.push_back(input);
+            while (input_queue.size() > 256) {
+                input_queue.pop_front();
+            }
         }
     }
 }
@@ -1219,11 +1238,11 @@ bool Renderer::Initialize(HWND window_handle, int client_width, int client_heigh
     swap_desc.BufferDesc.Width = static_cast<UINT>(width);
     swap_desc.BufferDesc.Height = static_cast<UINT>(height);
     swap_desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    swap_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    swap_desc.OutputWindow = hwnd;
-    swap_desc.SampleDesc.Count = 1;
-    swap_desc.Windowed = TRUE;
-    swap_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        swap_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        swap_desc.OutputWindow = hwnd;
+        swap_desc.SampleDesc.Count = 1;
+        swap_desc.Windowed = TRUE;
+        swap_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     UINT flags = 0;
     D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
@@ -1673,14 +1692,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         UpdateCursorCapture(platform, false);
         return 0;
     case WM_INPUT: {
-        UINT data_size = 0;
-        GetRawInputData(reinterpret_cast<HRAWINPUT>(lparam), RID_INPUT, nullptr, &data_size, sizeof(RAWINPUTHEADER));
-        std::vector<uint8_t> raw_data(data_size);
-        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lparam), RID_INPUT, raw_data.data(), &data_size, sizeof(RAWINPUTHEADER)) == data_size) {
-            RAWINPUT* raw = reinterpret_cast<RAWINPUT*>(raw_data.data());
-            if (raw->header.dwType == RIM_TYPEMOUSE) {
-                platform.mouse_dx += static_cast<float>(raw->data.mouse.lLastX);
-                platform.mouse_dy += static_cast<float>(raw->data.mouse.lLastY);
+        RAWINPUT raw = {};
+        UINT data_size = sizeof(raw);
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lparam), RID_INPUT, &raw, &data_size, sizeof(RAWINPUTHEADER)) == data_size) {
+            if (raw.header.dwType == RIM_TYPEMOUSE) {
+                platform.mouse_dx += static_cast<float>(raw.data.mouse.lLastX);
+                platform.mouse_dy += static_cast<float>(raw.data.mouse.lLastY);
             }
         }
         return 0;
@@ -1902,8 +1919,7 @@ void ClientRuntime::HandleSnapshot(const SnapshotPacket& snapshot, double receip
     for (uint32_t i = 0; i < render_dummy_count; ++i) {
         RenderDummy& dummy = render_dummies[i];
         dummy.id = snapshot.dummies[i].id;
-        const Vec3 target_position = {snapshot.dummies[i].x, snapshot.dummies[i].y, snapshot.dummies[i].z};
-        dummy.position = dummy.alive ? dummy.position + (target_position - dummy.position) * 0.45f : target_position;
+        dummy.position = {snapshot.dummies[i].x, snapshot.dummies[i].y, snapshot.dummies[i].z};
         dummy.alive = snapshot.dummies[i].alive != 0;
         dummy.health = snapshot.dummies[i].health;
     }
@@ -1920,32 +1936,27 @@ void ClientRuntime::HandleSnapshot(const SnapshotPacket& snapshot, double receip
 
     const float position_delta = Length(it->state.position - authoritative.position);
     last_correction_cm = position_delta * 100.0f;
-    if (position_delta > 0.01f) {
-        max_correction_cm = std::max(max_correction_cm, last_correction_cm);
-        std::deque<PredictionEntry> remaining;
-        bool past_ack = false;
-        for (const PredictionEntry& entry : history) {
-            if (entry.input.sequence == snapshot.last_processed_input) {
-                past_ack = true;
-                continue;
-            }
-            if (past_ack) {
-                remaining.push_back(entry);
-            }
-        }
+    max_correction_cm = std::max(max_correction_cm, last_correction_cm);
 
-        predicted_player = authoritative;
-        history.clear();
-        for (PredictionEntry& entry : remaining) {
-            ApplyMovement(predicted_player, entry.input, world, kFixedDt);
-            ApplyWeaponPrediction(predicted_player, entry.input, kFixedDt);
-            entry.state = predicted_player;
-            history.push_back(entry);
+    std::deque<PredictionEntry> remaining;
+    bool past_ack = false;
+    for (const PredictionEntry& entry : history) {
+        if (entry.input.sequence == snapshot.last_processed_input) {
+            past_ack = true;
+            continue;
         }
-    } else {
-        while (!history.empty() && history.front().input.sequence <= snapshot.last_processed_input) {
-            history.pop_front();
+        if (past_ack) {
+            remaining.push_back(entry);
         }
+    }
+
+    predicted_player = authoritative;
+    history.clear();
+    for (PredictionEntry& entry : remaining) {
+        ApplyMovement(predicted_player, entry.input, world, kFixedDt);
+        ApplyWeaponPrediction(predicted_player, entry.input, kFixedDt);
+        entry.state = predicted_player;
+        history.push_back(entry);
     }
 }
 
