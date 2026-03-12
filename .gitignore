@@ -1,0 +1,17 @@
+.vs/
+.vscode/
+.idea/
+build/
+.toolchain/
+telemetry/
+config/settings.ini
+*.user
+*.suo
+*.tmp
+*.bak
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.pdb
