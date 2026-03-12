@@ -20,11 +20,12 @@ Rendering must never alter movement, weapon cadence, hit registration, or collis
 - `Win32 platform layer`
   - Window lifecycle
   - Raw input
-  - Fullscreen and resolution changes
+  - Borderless fullscreen startup plus fullscreen and resolution changes
   - Telemetry file creation
 - `D3D11 renderer`
   - Simple colored geometry for world, dummies, and debug overlays
   - Immediate-mode style 2D HUD and settings overlay
+  - Row-major matrix upload path that matches the CPU-side transform math used by the fixed-function debug renderer
 - `Local server`
   - Fixed tick loop
   - World simulation
@@ -81,8 +82,13 @@ Always keep enough instrumentation to answer these questions quickly:
 - What happened in the last few damage events?
 
 Runtime telemetry is written to `telemetry/` and should remain lightweight enough for regular local playtests.
+For render verification, the executable can also dump a startup back-buffer image to `telemetry/startup_frame.bmp` when launched with `ACCRETION_CAPTURE_STARTUP_FRAME=1`.
 
 ## Documentation Rules
 - Append new shipped features to the ordered list in `README.md`.
 - Update this file whenever changing build assumptions, tick rates, packet flow, simulation ownership, or render/sim boundaries.
 - Update `AGENTS.md` when a workflow becomes recurring.
+
+## Startup Defaults
+- Settings version `3` defaults to fullscreen-first launch so the initial playtest opens at the active monitor size instead of a smaller bootstrap window.
+- Legacy configs are migrated forward on load so earlier local settings files do not keep forcing the old startup path.

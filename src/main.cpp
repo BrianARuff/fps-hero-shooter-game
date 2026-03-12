@@ -46,6 +46,7 @@ constexpr double kFixedDt = 1.0 / kSimHz;
 constexpr uint32_t kPacketMagic = 0x41434352u;
 constexpr int kMaxDummies = 16;
 constexpr int kHistorySize = 512;
+constexpr int kCurrentSettingsVersion = 3;
 constexpr float kPi = 3.14159265359f;
 
 enum ButtonBits : uint8_t {
@@ -175,6 +176,16 @@ Mat4 Multiply(const Mat4& a, const Mat4& b) {
                 a.m[r][1] * b.m[1][c] +
                 a.m[r][2] * b.m[2][c] +
                 a.m[r][3] * b.m[3][c];
+        }
+    }
+    return out;
+}
+
+Mat4 Transpose(const Mat4& in) {
+    Mat4 out = {};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out.m[r][c] = in.m[c][r];
         }
     }
     return out;
@@ -334,12 +345,13 @@ AppPaths BuildAppPaths() {
 }
 
 struct Settings {
+    int version = 0;
     float mouse_sensitivity = 0.08f;
     bool raw_input = true;
     bool invert_y = false;
     float fov_horizontal = 103.0f;
     int resolution_index = 2;
-    bool fullscreen = false;
+    bool fullscreen = true;
     int frame_cap_index = 0;
     bool show_hitmarkers = true;
 };
@@ -349,10 +361,12 @@ Settings LoadSettings(const AppPaths& paths) {
     const std::filesystem::path file_path = paths.config_dir / "settings.ini";
     std::ifstream file(file_path);
     if (!file.is_open()) {
+        settings.version = kCurrentSettingsVersion;
         return settings;
     }
 
     std::string line;
+    bool has_version = false;
     while (std::getline(file, line)) {
         const size_t equals = line.find('=');
         if (equals == std::string::npos) {
@@ -360,7 +374,10 @@ Settings LoadSettings(const AppPaths& paths) {
         }
         const std::string key = line.substr(0, equals);
         const std::string value = line.substr(equals + 1);
-        if (key == "mouse_sensitivity") {
+        if (key == "settings_version") {
+            settings.version = std::stoi(value);
+            has_version = true;
+        } else if (key == "mouse_sensitivity") {
             settings.mouse_sensitivity = std::stof(value);
         } else if (key == "raw_input") {
             settings.raw_input = value == "1";
@@ -379,6 +396,12 @@ Settings LoadSettings(const AppPaths& paths) {
         }
     }
 
+    // Migrate pre-v2 configs to the new fullscreen-first startup default.
+    if (!has_version || settings.version < kCurrentSettingsVersion) {
+        settings.version = kCurrentSettingsVersion;
+        settings.fullscreen = true;
+    }
+
     return settings;
 }
 
@@ -388,6 +411,7 @@ void SaveSettings(const AppPaths& paths, const Settings& settings) {
     if (!file.is_open()) {
         return;
     }
+    file << "settings_version=" << settings.version << "\n";
     file << "mouse_sensitivity=" << settings.mouse_sensitivity << "\n";
     file << "raw_input=" << (settings.raw_input ? 1 : 0) << "\n";
     file << "invert_y=" << (settings.invert_y ? 1 : 0) << "\n";
@@ -1226,6 +1250,7 @@ struct Renderer {
     void PushText(float x, float y, const char* text, const Color& color);
     void DrawBuffer(DynamicBuffer& dynamic_buffer, const std::vector<RenderVertex>& vertices, D3D11_PRIMITIVE_TOPOLOGY topology, const Mat4& matrix, bool use_depth);
     void Flush(const Mat4& view_projection);
+    bool CaptureBackBufferBmp(const std::filesystem::path& file_path);
 };
 
 bool Renderer::Initialize(HWND window_handle, int client_width, int client_height) {
@@ -1306,7 +1331,7 @@ bool Renderer::CreateShaders() {
         "cbuffer Camera : register(b0) { float4x4 u_matrix; };"
         "struct VSIn { float3 pos : POSITION; float4 color : COLOR; };"
         "struct PSIn { float4 pos : SV_Position; float4 color : COLOR; };"
-        "PSIn vs_main(VSIn input) { PSIn output; output.pos = mul(float4(input.pos, 1.0f), u_matrix); output.color = input.color; return output; }"
+        "PSIn vs_main(VSIn input) { PSIn output; output.pos = mul(u_matrix, float4(input.pos, 1.0f)); output.color = input.color; return output; }"
         "float4 ps_main(PSIn input) : SV_Target { return input.color; }";
 
     ID3DBlob* vs_blob = nullptr;
@@ -1369,6 +1394,7 @@ bool Renderer::CreateStates() {
     D3D11_RASTERIZER_DESC raster_desc = {};
     raster_desc.FillMode = D3D11_FILL_SOLID;
     raster_desc.CullMode = D3D11_CULL_BACK;
+    raster_desc.FrontCounterClockwise = TRUE;
     raster_desc.DepthClipEnable = TRUE;
     if (FAILED(device->CreateRasterizerState(&raster_desc, &rasterizer_state))) {
         return false;
@@ -1567,7 +1593,8 @@ void Renderer::DrawBuffer(DynamicBuffer& dynamic_buffer, const std::vector<Rende
 
     D3D11_MAPPED_SUBRESOURCE cb_map = {};
     if (SUCCEEDED(context->Map(constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &cb_map))) {
-        std::memcpy(cb_map.pData, &matrix, sizeof(matrix));
+        const Mat4 gpu_matrix = Transpose(matrix);
+        std::memcpy(cb_map.pData, &gpu_matrix, sizeof(gpu_matrix));
         context->Unmap(constant_buffer, 0);
     }
 
@@ -1589,10 +1616,109 @@ void Renderer::Flush(const Mat4& view_projection) {
     DrawBuffer(line_buffer_2d, lines_2d, D3D11_PRIMITIVE_TOPOLOGY_LINELIST, ortho, false);
 }
 
+bool Renderer::CaptureBackBufferBmp(const std::filesystem::path& file_path) {
+    if (!swap_chain || !device || !context) {
+        return false;
+    }
+
+    ID3D11Texture2D* back_buffer = nullptr;
+    HRESULT hr = swap_chain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back_buffer));
+    if (FAILED(hr)) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    back_buffer->GetDesc(&desc);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+
+    ID3D11Texture2D* staging = nullptr;
+    hr = device->CreateTexture2D(&desc, nullptr, &staging);
+    if (FAILED(hr)) {
+        SafeRelease(back_buffer);
+        return false;
+    }
+
+    context->CopyResource(staging, back_buffer);
+    context->Flush();
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    hr = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        SafeRelease(staging);
+        SafeRelease(back_buffer);
+        return false;
+    }
+
+    const uint32_t output_width = desc.Width;
+    const uint32_t output_height = desc.Height;
+    const uint32_t row_stride = output_width * 3u;
+    const uint32_t padded_row_stride = (row_stride + 3u) & ~3u;
+    const uint32_t pixel_data_size = padded_row_stride * output_height;
+    const uint32_t file_size = 54u + pixel_data_size;
+
+    std::ofstream file(file_path, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        context->Unmap(staging, 0);
+        SafeRelease(staging);
+        SafeRelease(back_buffer);
+        return false;
+    }
+
+    auto write_u16 = [&](uint16_t value) {
+        file.put(static_cast<char>(value & 0xff));
+        file.put(static_cast<char>((value >> 8) & 0xff));
+    };
+    auto write_u32 = [&](uint32_t value) {
+        file.put(static_cast<char>(value & 0xff));
+        file.put(static_cast<char>((value >> 8) & 0xff));
+        file.put(static_cast<char>((value >> 16) & 0xff));
+        file.put(static_cast<char>((value >> 24) & 0xff));
+    };
+
+    write_u16(0x4d42);
+    write_u32(file_size);
+    write_u16(0);
+    write_u16(0);
+    write_u32(54);
+    write_u32(40);
+    write_u32(output_width);
+    write_u32(output_height);
+    write_u16(1);
+    write_u16(24);
+    write_u32(0);
+    write_u32(pixel_data_size);
+    write_u32(2835);
+    write_u32(2835);
+    write_u32(0);
+    write_u32(0);
+
+    std::vector<uint8_t> row(padded_row_stride, 0);
+    for (int y = static_cast<int>(output_height) - 1; y >= 0; --y) {
+        const uint8_t* src = static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch;
+        for (uint32_t x = 0; x < output_width; ++x) {
+            row[x * 3 + 0] = src[x * 4 + 2];
+            row[x * 3 + 1] = src[x * 4 + 1];
+            row[x * 3 + 2] = src[x * 4 + 0];
+        }
+        file.write(reinterpret_cast<const char*>(row.data()), padded_row_stride);
+    }
+
+    context->Unmap(staging, 0);
+    SafeRelease(staging);
+    SafeRelease(back_buffer);
+    return file.good();
+}
+
 struct PlatformState {
     HWND hwnd = nullptr;
     bool running = true;
     bool focused = true;
+    bool gameplay_focus = false;
     bool mouse_captured = false;
     bool resized = false;
     int client_width = 1600;
@@ -1605,6 +1731,7 @@ struct PlatformState {
     float mouse_dy = 0.0f;
     POINT last_cursor = {};
     bool cursor_valid = false;
+    double ignore_mouse_until = 0.0;
     bool fullscreen = false;
     RECT windowed_rect = {0, 0, 1600, 900};
     DWORD windowed_style = WS_OVERLAPPEDWINDOW;
@@ -1618,6 +1745,10 @@ void UpdateCursorCapture(PlatformState& platform, bool capture) {
     }
     platform.mouse_captured = capture;
     if (capture) {
+        platform.mouse_dx = 0.0f;
+        platform.mouse_dy = 0.0f;
+        platform.cursor_valid = false;
+        platform.ignore_mouse_until = NowSeconds() + 0.10;
         RECT client_rect = {};
         GetClientRect(platform.hwnd, &client_rect);
         POINT tl = {client_rect.left, client_rect.top};
@@ -1627,9 +1758,12 @@ void UpdateCursorCapture(PlatformState& platform, bool capture) {
         RECT clip = {tl.x, tl.y, br.x, br.y};
         ClipCursor(&clip);
         SetCapture(platform.hwnd);
+        SetCursor(nullptr);
     } else {
         ClipCursor(nullptr);
         ReleaseCapture();
+        platform.ignore_mouse_until = 0.0;
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
     }
 }
 
@@ -1641,6 +1775,26 @@ void ApplyResolution(PlatformState& platform, const Settings& settings) {
         SetWindowPos(platform.hwnd, nullptr, platform.windowed_rect.left, platform.windowed_rect.top,
             rect.right - rect.left, rect.bottom - rect.top, SWP_NOZORDER | SWP_NOACTIVATE);
     }
+}
+
+RECT GetPrimaryMonitorRect() {
+    MONITORINFO monitor_info = {sizeof(monitor_info)};
+    GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &monitor_info);
+    return monitor_info.rcMonitor;
+}
+
+RECT BuildDefaultWindowedRect(const Settings& settings) {
+    RECT rect = {0, 0, kResolutions[settings.resolution_index].width, kResolutions[settings.resolution_index].height};
+    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+
+    const RECT monitor_rect = GetPrimaryMonitorRect();
+    const int monitor_width = monitor_rect.right - monitor_rect.left;
+    const int monitor_height = monitor_rect.bottom - monitor_rect.top;
+    const int window_width = rect.right - rect.left;
+    const int window_height = rect.bottom - rect.top;
+    const int x = monitor_rect.left + std::max(0, (monitor_width - window_width) / 2);
+    const int y = monitor_rect.top + std::max(0, (monitor_height - window_height) / 2);
+    return {x, y, x + window_width, y + window_height};
 }
 
 void ToggleFullscreen(PlatformState& platform, Settings& settings) {
@@ -1689,6 +1843,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         return 0;
     case WM_KILLFOCUS:
         platform.focused = false;
+        platform.gameplay_focus = false;
         UpdateCursorCapture(platform, false);
         return 0;
     case WM_INPUT: {
@@ -1715,6 +1870,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         }
         return 0;
     case WM_LBUTTONDOWN:
+        if (platform.focused) {
+            platform.gameplay_focus = true;
+        }
         platform.left_mouse_down = true;
         return 0;
     case WM_LBUTTONUP:
@@ -2200,22 +2358,23 @@ void DrawCrosshair(Renderer& renderer, const ClientRuntime& client, int width, i
 }
 
 void DrawWorld(Renderer& renderer, const WorldGeometry& world, const ClientRuntime& client) {
-    renderer.PushBoxSolid({{-10.0f, -0.05f, -2.0f}, {10.0f, 0.0f, 58.0f}}, {0.14f, 0.16f, 0.19f, 1.0f});
-    renderer.PushBoxSolid({{-10.0f, 0.0f, -2.0f}, {-9.5f, 6.0f, 58.0f}}, {0.10f, 0.18f, 0.24f, 1.0f});
-    renderer.PushBoxSolid({{9.5f, 0.0f, -2.0f}, {10.0f, 6.0f, 58.0f}}, {0.10f, 0.18f, 0.24f, 1.0f});
-    renderer.PushBoxSolid({{-10.0f, 0.0f, -2.5f}, {10.0f, 6.0f, -2.0f}}, {0.10f, 0.18f, 0.24f, 1.0f});
-    renderer.PushBoxSolid({{-10.0f, 0.0f, 58.0f}, {10.0f, 6.0f, 58.5f}}, {0.10f, 0.18f, 0.24f, 1.0f});
-    renderer.PushBoxSolid({{-6.5f, 0.0f, 14.0f}, {-2.5f, 1.5f, 18.0f}}, {0.28f, 0.30f, 0.22f, 1.0f});
-    renderer.PushBoxSolid({{-1.5f, 0.0f, 24.0f}, {1.5f, 1.8f, 25.5f}}, {0.36f, 0.26f, 0.20f, 1.0f});
-    renderer.PushBoxSolid({{4.5f, 0.0f, 38.0f}, {7.0f, 1.6f, 39.5f}}, {0.24f, 0.20f, 0.34f, 1.0f});
-    renderer.PushBoxSolid({{-8.0f, 0.0f, 46.0f}, {-5.5f, 1.2f, 49.0f}}, {0.22f, 0.28f, 0.18f, 1.0f});
+    renderer.PushBoxSolid({{-10.0f, -0.05f, -2.0f}, {10.0f, 0.0f, 58.0f}}, {0.18f, 0.24f, 0.30f, 1.0f});
+    renderer.PushBoxSolid({{-10.0f, 0.0f, -2.0f}, {-9.5f, 6.0f, 58.0f}}, {0.16f, 0.32f, 0.42f, 1.0f});
+    renderer.PushBoxSolid({{9.5f, 0.0f, -2.0f}, {10.0f, 6.0f, 58.0f}}, {0.16f, 0.32f, 0.42f, 1.0f});
+    renderer.PushBoxSolid({{-10.0f, 0.0f, -2.5f}, {10.0f, 6.0f, -2.0f}}, {0.16f, 0.32f, 0.42f, 1.0f});
+    renderer.PushBoxSolid({{-10.0f, 0.0f, 58.0f}, {10.0f, 6.0f, 58.5f}}, {0.16f, 0.32f, 0.42f, 1.0f});
+    renderer.PushBoxSolid({{-0.12f, 0.0f, -2.0f}, {0.12f, 0.02f, 58.0f}}, {0.14f, 0.78f, 0.88f, 1.0f});
+    renderer.PushBoxSolid({{-6.5f, 0.0f, 14.0f}, {-2.5f, 1.5f, 18.0f}}, {0.40f, 0.42f, 0.26f, 1.0f});
+    renderer.PushBoxSolid({{-1.5f, 0.0f, 24.0f}, {1.5f, 1.8f, 25.5f}}, {0.50f, 0.34f, 0.24f, 1.0f});
+    renderer.PushBoxSolid({{4.5f, 0.0f, 38.0f}, {7.0f, 1.6f, 39.5f}}, {0.32f, 0.28f, 0.46f, 1.0f});
+    renderer.PushBoxSolid({{-8.0f, 0.0f, 46.0f}, {-5.5f, 1.2f, 49.0f}}, {0.28f, 0.38f, 0.24f, 1.0f});
 
     const std::array<float, 4> markers = {{10.0f, 20.0f, 35.0f, 50.0f}};
     const std::array<Color, 4> colors = {{
-        {0.38f, 0.68f, 1.0f, 0.75f},
-        {0.34f, 0.98f, 0.76f, 0.75f},
+        {0.16f, 0.74f, 0.84f, 0.75f},
+        {0.20f, 0.88f, 0.72f, 0.75f},
         {1.0f, 0.84f, 0.36f, 0.75f},
-        {1.0f, 0.52f, 0.42f, 0.75f},
+        {1.0f, 0.60f, 0.42f, 0.75f},
     }};
     for (size_t i = 0; i < markers.size(); ++i) {
         const float z = markers[i];
@@ -2229,8 +2388,8 @@ void DrawWorld(Renderer& renderer, const WorldGeometry& world, const ClientRunti
         }
         const Aabb body = MakeDummyBodyAabb(dummy.position);
         const Aabb head = MakeDummyHeadAabb(dummy.position);
-        renderer.PushBoxSolid(body, {0.88f, 0.90f, 0.96f, 1.0f});
-        renderer.PushBoxSolid(head, {1.0f, 0.54f, 0.36f, 1.0f});
+        renderer.PushBoxSolid(body, {0.94f, 0.96f, 1.0f, 1.0f});
+        renderer.PushBoxSolid(head, {1.0f, 0.62f, 0.30f, 1.0f});
         if (client.show_hitboxes) {
             renderer.PushBoxWire(body, {0.34f, 1.0f, 0.80f, 1.0f});
             renderer.PushBoxWire(head, {1.0f, 0.80f, 0.32f, 1.0f});
@@ -2276,18 +2435,33 @@ HWND CreateMainWindow(HINSTANCE instance, PlatformState& platform, const Setting
         return nullptr;
     }
 
-    RECT rect = {0, 0, kResolutions[settings.resolution_index].width, kResolutions[settings.resolution_index].height};
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND hwnd = CreateWindowExW(0, kWindowClassName, kWindowTitle, WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top,
+    const RECT monitor_rect = GetPrimaryMonitorRect();
+    platform.windowed_style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+    platform.windowed_rect = BuildDefaultWindowedRect(settings);
+
+    DWORD style = platform.windowed_style;
+    int x = platform.windowed_rect.left;
+    int y = platform.windowed_rect.top;
+    int width = platform.windowed_rect.right - platform.windowed_rect.left;
+    int height = platform.windowed_rect.bottom - platform.windowed_rect.top;
+    if (settings.fullscreen) {
+        style = WS_POPUP | WS_VISIBLE;
+        x = monitor_rect.left;
+        y = monitor_rect.top;
+        width = monitor_rect.right - monitor_rect.left;
+        height = monitor_rect.bottom - monitor_rect.top;
+    }
+
+    HWND hwnd = CreateWindowExW(0, kWindowClassName, kWindowTitle, style,
+        x, y, width, height,
         nullptr, nullptr, instance, nullptr);
     if (!hwnd) {
         return nullptr;
     }
     platform.hwnd = hwnd;
-    platform.client_width = kResolutions[settings.resolution_index].width;
-    platform.client_height = kResolutions[settings.resolution_index].height;
-    platform.windowed_style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+    platform.client_width = settings.fullscreen ? (monitor_rect.right - monitor_rect.left) : kResolutions[settings.resolution_index].width;
+    platform.client_height = settings.fullscreen ? (monitor_rect.bottom - monitor_rect.top) : kResolutions[settings.resolution_index].height;
+    platform.fullscreen = settings.fullscreen;
     return hwnd;
 }
 
@@ -2321,6 +2495,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     AppPaths paths = BuildAppPaths();
     Settings settings = LoadSettings(paths);
+    SaveSettings(paths, settings);
     TelemetryLogger telemetry = {};
     telemetry.Initialize(paths);
 
@@ -2342,10 +2517,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         WSACleanup();
         timeEndPeriod(1);
         return 1;
-    }
-
-    if (settings.fullscreen) {
-        ToggleFullscreen(platform, settings);
     }
 
     ServerDebugStats server_stats = {};
@@ -2375,6 +2546,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     float view_yaw = 0.0f;
     float view_pitch = 0.0f;
     double previous_time = NowSeconds();
+    wchar_t capture_env[8] = {};
+    const bool capture_startup_frame = GetEnvironmentVariableW(L"ACCRETION_CAPTURE_STARTUP_FRAME", capture_env, static_cast<DWORD>(std::size(capture_env))) > 0;
+    const double capture_ready_time = previous_time + 0.25;
+    bool startup_frame_captured = false;
     double sim_accumulator = 0.0;
     double render_stats_time = previous_time;
     int render_frames_this_second = 0;
@@ -2414,14 +2589,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             UpdateCursorCapture(platform, false);
             HandleMenuInput(menu, settings, platform, paths);
         } else {
-            UpdateCursorCapture(platform, platform.focused);
+            UpdateCursorCapture(platform, platform.focused && platform.gameplay_focus);
         }
 
-        if (!menu.open && platform.focused) {
+        if (!menu.open && platform.focused && platform.mouse_captured) {
             if (settings.raw_input) {
-                const float invert = settings.invert_y ? 1.0f : -1.0f;
-                view_yaw += platform.mouse_dx * settings.mouse_sensitivity * 0.01f;
-                view_pitch += platform.mouse_dy * settings.mouse_sensitivity * 0.01f * invert;
+                if (frame_start >= platform.ignore_mouse_until) {
+                    const float invert = settings.invert_y ? 1.0f : -1.0f;
+                    view_yaw += platform.mouse_dx * settings.mouse_sensitivity * 0.01f;
+                    view_pitch += platform.mouse_dy * settings.mouse_sensitivity * 0.01f * invert;
+                }
             } else {
                 POINT cursor = {};
                 GetCursorPos(&cursor);
@@ -2431,9 +2608,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                 }
                 const float dx = static_cast<float>(cursor.x - platform.last_cursor.x);
                 const float dy = static_cast<float>(cursor.y - platform.last_cursor.y);
-                const float invert = settings.invert_y ? 1.0f : -1.0f;
-                view_yaw += dx * settings.mouse_sensitivity * 0.01f;
-                view_pitch += dy * settings.mouse_sensitivity * 0.01f * invert;
+                if (frame_start >= platform.ignore_mouse_until) {
+                    const float invert = settings.invert_y ? 1.0f : -1.0f;
+                    view_yaw += dx * settings.mouse_sensitivity * 0.01f;
+                    view_pitch += dy * settings.mouse_sensitivity * 0.01f * invert;
+                }
                 platform.last_cursor = cursor;
             }
         } else {
@@ -2444,7 +2623,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
         while (sim_accumulator >= kFixedDt) {
             InputCommand input = {};
-            if (!menu.open && platform.focused) {
+            if (!menu.open && platform.focused && platform.mouse_captured) {
                 input = client.BuildInput(platform, view_yaw, view_pitch);
             } else {
                 input.sequence = ++client.local_sequence;
@@ -2485,12 +2664,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
 
         renderer.Clear();
-        renderer.BeginFrame({0.02f, 0.03f, 0.05f, 1.0f});
+        renderer.BeginFrame({0.04f, 0.06f, 0.09f, 1.0f});
         DrawWorld(renderer, server.world, client);
         DrawRangeGuide(renderer, client, renderer.width);
         DrawDebugHud(renderer, client, server_stats, renderer.width, renderer.height);
         DrawCrosshair(renderer, client, renderer.width, renderer.height, frame_start);
         DrawSettingsMenu(renderer, menu, settings, renderer.width, renderer.height);
+        if (!platform.mouse_captured && !menu.open) {
+            renderer.PushText(renderer.width * 0.5f - 110.0f, renderer.height * 0.5f + 42.0f,
+                "LEFT CLICK TO ENTER RANGE", {0.98f, 0.95f, 0.76f, 1.0f});
+        }
         if (settings.show_hitmarkers && client.elimination_time > frame_start) {
             renderer.PushText(renderer.width * 0.5f - 18.0f, renderer.height * 0.5f + 28.0f, "ELIM", {1.0f, 0.84f, 0.34f, 1.0f});
         }
@@ -2505,6 +2688,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         const Vec3 target = eye + ForwardFromAngles(view_yaw, view_pitch);
         const Mat4 view = LookAtLh(eye, target, {0.0f, 1.0f, 0.0f});
         renderer.Flush(Multiply(view, projection));
+        if (capture_startup_frame && !startup_frame_captured && frame_start >= capture_ready_time) {
+            startup_frame_captured = renderer.CaptureBackBufferBmp(paths.telemetry_dir / "startup_frame.bmp");
+        }
         renderer.Present();
 
         const double velocity = Length({client.predicted_player.velocity.x, 0.0f, client.predicted_player.velocity.z});

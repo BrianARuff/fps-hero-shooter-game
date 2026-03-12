@@ -14,8 +14,10 @@
 6. Build and smoke test before handing off:
    - `powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1`
    - Launch `dist/Accretion.exe`
-7. Do not couple physics to render delta time. Movement, combat, collision, and weapon cadence must stay on fixed simulation steps.
-8. Prefer additive docs over tribal knowledge. If you discover a recurring workflow, add it here.
+7. When a change touches rendering, camera transforms, fullscreen startup, or mouse capture, perform a visual startup verification instead of relying only on a process-alive smoke test.
+   - Use `ACCRETION_CAPTURE_STARTUP_FRAME=1` when you need the renderer to dump a real back-buffer frame to `telemetry/startup_frame.bmp`.
+8. Do not couple physics to render delta time. Movement, combat, collision, and weapon cadence must stay on fixed simulation steps.
+9. Prefer additive docs over tribal knowledge. If you discover a recurring workflow, add it here.
 
 ## Current Conventions
 - Project codename: `Project Accretion`
@@ -35,4 +37,3 @@
 - Do not add ADS, projectile weapons, hero abilities, or audio until they are intentionally scoped.
 - Do not replace the local-authoritative approach with single-player shortcuts.
 - Do not remove telemetry, debug visibility, or prediction/correction instrumentation without replacing them with something equivalent or better.
-
