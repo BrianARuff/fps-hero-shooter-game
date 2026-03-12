@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cwchar>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -1331,7 +1332,7 @@ bool Renderer::CreateShaders() {
         "cbuffer Camera : register(b0) { float4x4 u_matrix; };"
         "struct VSIn { float3 pos : POSITION; float4 color : COLOR; };"
         "struct PSIn { float4 pos : SV_Position; float4 color : COLOR; };"
-        "PSIn vs_main(VSIn input) { PSIn output; output.pos = mul(u_matrix, float4(input.pos, 1.0f)); output.color = input.color; return output; }"
+        "PSIn vs_main(VSIn input) { PSIn output; output.pos = mul(float4(input.pos, 1.0f), u_matrix); output.color = input.color; return output; }"
         "float4 ps_main(PSIn input) : SV_Target { return input.color; }";
 
     ID3DBlob* vs_blob = nullptr;
@@ -1393,8 +1394,7 @@ bool Renderer::CreateShaders() {
 bool Renderer::CreateStates() {
     D3D11_RASTERIZER_DESC raster_desc = {};
     raster_desc.FillMode = D3D11_FILL_SOLID;
-    raster_desc.CullMode = D3D11_CULL_BACK;
-    raster_desc.FrontCounterClockwise = TRUE;
+    raster_desc.CullMode = D3D11_CULL_NONE;
     raster_desc.DepthClipEnable = TRUE;
     if (FAILED(device->CreateRasterizerState(&raster_desc, &rasterizer_state))) {
         return false;
@@ -1719,6 +1719,7 @@ struct PlatformState {
     bool running = true;
     bool focused = true;
     bool gameplay_focus = false;
+    bool pending_gameplay_focus = false;
     bool mouse_captured = false;
     bool resized = false;
     int client_width = 1600;
@@ -1844,6 +1845,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
     case WM_KILLFOCUS:
         platform.focused = false;
         platform.gameplay_focus = false;
+        platform.pending_gameplay_focus = false;
         UpdateCursorCapture(platform, false);
         return 0;
     case WM_INPUT: {
@@ -1870,12 +1872,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         }
         return 0;
     case WM_LBUTTONDOWN:
-        if (platform.focused) {
-            platform.gameplay_focus = true;
+        if (platform.focused && !platform.mouse_captured) {
+            platform.pending_gameplay_focus = true;
+            return 0;
         }
         platform.left_mouse_down = true;
         return 0;
     case WM_LBUTTONUP:
+        if (platform.pending_gameplay_focus) {
+            platform.pending_gameplay_focus = false;
+            platform.gameplay_focus = true;
+            platform.left_mouse_down = false;
+            return 0;
+        }
         platform.left_mouse_down = false;
         return 0;
     case WM_SETCURSOR:
@@ -2483,7 +2492,7 @@ void SleepForFrameCap(double target_frame_seconds, double frame_start) {
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     SetProcessDPIAware();
     timeBeginPeriod(1);
 
@@ -2546,8 +2555,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     float view_yaw = 0.0f;
     float view_pitch = 0.0f;
     double previous_time = NowSeconds();
-    wchar_t capture_env[8] = {};
-    const bool capture_startup_frame = GetEnvironmentVariableW(L"ACCRETION_CAPTURE_STARTUP_FRAME", capture_env, static_cast<DWORD>(std::size(capture_env))) > 0;
+    const bool capture_startup_frame = command_line && std::wcsstr(command_line, L"--capture-startup-frame") != nullptr;
     const double capture_ready_time = previous_time + 0.25;
     bool startup_frame_captured = false;
     double sim_accumulator = 0.0;

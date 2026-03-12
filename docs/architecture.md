@@ -82,7 +82,7 @@ Always keep enough instrumentation to answer these questions quickly:
 - What happened in the last few damage events?
 
 Runtime telemetry is written to `telemetry/` and should remain lightweight enough for regular local playtests.
-For render verification, the executable can also dump a startup back-buffer image to `telemetry/startup_frame.bmp` when launched with `ACCRETION_CAPTURE_STARTUP_FRAME=1`.
+For render verification, the executable can also dump a startup back-buffer image to `telemetry/startup_frame.bmp` when launched with `--capture-startup-frame`.
 
 ## Documentation Rules
 - Append new shipped features to the ordered list in `README.md`.
@@ -92,3 +92,4 @@ For render verification, the executable can also dump a startup back-buffer imag
 ## Startup Defaults
 - Settings version `3` defaults to fullscreen-first launch so the initial playtest opens at the active monitor size instead of a smaller bootstrap window.
 - Legacy configs are migrated forward on load so earlier local settings files do not keep forcing the old startup path.
+- Gameplay cursor capture is armed on the first click-and-release into the range so startup and menu transitions do not inject an accidental camera turn.

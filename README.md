@@ -17,7 +17,7 @@ Project Accretion is a Windows-first C++ hero shooter foundation focused on comp
 - `WASD`: move
 - `Space`: jump
 - `Left Ctrl`: crouch
-- `Left Mouse`: click once to lock into the range, then fire
+- `Left Mouse`: click and release once to lock into the range, then fire
 - `R`: reload
 - `Esc`: toggle settings menu
 - `F1`: toggle debug HUD
@@ -40,6 +40,8 @@ Project Accretion is a Windows-first C++ hero shooter foundation focused on comp
 12. Added telemetry logging for frametimes, tick jitter, and key gameplay events.
 13. Hardened the baseline for competitive correctness by carrying authoritative movement and weapon timer state in snapshots, fixing head-versus-body hit resolution, removing target-render smoothing that could mislead aim, and reducing raw-input overhead.
 14. Fixed the startup rendering path by aligning shader matrix layout with CPU-side transforms, corrected front-face handling for the placeholder geometry, migrated legacy configs to a fullscreen-first default, and cleaned up cursor capture so the first playable view opens visibly and only locks input after an intentional click into the range.
+15. Added a documented render-verification hook that can dump a real startup back-buffer frame for debugging camera and projection regressions without relying on desktop screenshots.
+16. Stabilized the gameplay-entry input handoff so the first click into the range no longer doubles as a fire input or an abrupt camera-turn event.
 
 ## Next Likely Steps
 - Add stronger lag-compensation diagnostics and configurable packet simulation.

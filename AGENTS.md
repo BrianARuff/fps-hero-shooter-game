@@ -9,13 +9,16 @@
 1. Read `README.md` and `docs/architecture.md` before changing code that touches simulation, networking, rendering, timing, or settings.
 2. Preserve the 256 Hz server simulation target unless a change is explicitly documented in `docs/architecture.md`.
 3. Keep the project producing a clickable Windows executable at `dist/Accretion.exe`.
-4. When you add a user-facing or developer-facing feature, append it to the ordered feature log in `README.md`.
-5. When you change architecture, timing, packet flow, build workflow, or toolchain assumptions, update `docs/architecture.md` in the same change.
+4. Keep the documentation in sync with development changes in the same edit set.
+   - Append shipped user-facing and developer-facing features to the ordered feature log in `README.md`.
+   - Update `docs/architecture.md` whenever architecture, timing, packet flow, rendering boundaries, build workflow, or toolchain assumptions change.
+   - Update `AGENTS.md` whenever a workflow, verification step, or contributor pattern becomes recurring.
+   - If a change introduces a new debugging, profiling, or verification workflow, document where it lives and when future agents should use it.
 6. Build and smoke test before handing off:
    - `powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1`
    - Launch `dist/Accretion.exe`
 7. When a change touches rendering, camera transforms, fullscreen startup, or mouse capture, perform a visual startup verification instead of relying only on a process-alive smoke test.
-   - Use `ACCRETION_CAPTURE_STARTUP_FRAME=1` when you need the renderer to dump a real back-buffer frame to `telemetry/startup_frame.bmp`.
+   - Use `dist\Accretion.exe --capture-startup-frame` when you need the renderer to dump a real back-buffer frame to `telemetry/startup_frame.bmp`.
 8. Do not couple physics to render delta time. Movement, combat, collision, and weapon cadence must stay on fixed simulation steps.
 9. Prefer additive docs over tribal knowledge. If you discover a recurring workflow, add it here.
 
