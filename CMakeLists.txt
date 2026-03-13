@@ -41,9 +41,10 @@ target_link_libraries(Accretion PRIVATE
     d3d11
     dxgi
     gdi32
+    ole32
     user32
     shell32
     ws2_32
     winmm
+    xaudio2_9
 )
-

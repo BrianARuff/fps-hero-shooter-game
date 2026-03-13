@@ -17,7 +17,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <objbase.h>
 #include <mmsystem.h>
+#include <xaudio2.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 
@@ -47,8 +49,9 @@ constexpr double kFixedDt = 1.0 / kSimHz;
 constexpr uint32_t kPacketMagic = 0x41434352u;
 constexpr int kMaxDummies = 16;
 constexpr int kHistorySize = 512;
-constexpr int kCurrentSettingsVersion = 3;
+constexpr int kCurrentSettingsVersion = 4;
 constexpr float kPi = 3.14159265359f;
+constexpr float kMaxShotDistance = 120.0f;
 
 enum ButtonBits : uint8_t {
     Button_Jump = 1 << 0,
@@ -111,8 +114,16 @@ float Clamp(float v, float min_v, float max_v) {
     return std::max(min_v, std::min(max_v, v));
 }
 
+float Saturate(float v) {
+    return Clamp(v, 0.0f, 1.0f);
+}
+
 float Lerp(float a, float b, float t) {
     return a + (b - a) * t;
+}
+
+Vec2 operator+(const Vec2& a, const Vec2& b) {
+    return {a.x + b.x, a.y + b.y};
 }
 
 Vec3 operator+(const Vec3& a, const Vec3& b) {
@@ -147,7 +158,15 @@ float LengthSq(const Vec3& v) {
     return Dot(v, v);
 }
 
+float LengthSq(const Vec2& v) {
+    return v.x * v.x + v.y * v.y;
+}
+
 float Length(const Vec3& v) {
+    return std::sqrt(LengthSq(v));
+}
+
+float Length(const Vec2& v) {
     return std::sqrt(LengthSq(v));
 }
 
@@ -157,6 +176,15 @@ Vec3 Normalize(const Vec3& v) {
         return {};
     }
     return v / len;
+}
+
+Vec2 Rotate(const Vec2& point, float radians) {
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    return {
+        point.x * c - point.y * s,
+        point.x * s + point.y * c,
+    };
 }
 
 Mat4 Identity() {
@@ -355,6 +383,9 @@ struct Settings {
     bool fullscreen = true;
     int frame_cap_index = 0;
     bool show_hitmarkers = true;
+    float audio_master_volume = 0.85f;
+    float audio_weapon_volume = 0.92f;
+    float audio_movement_volume = 0.78f;
 };
 
 Settings LoadSettings(const AppPaths& paths) {
@@ -394,14 +425,20 @@ Settings LoadSettings(const AppPaths& paths) {
             settings.frame_cap_index = std::clamp(std::stoi(value), 0, static_cast<int>(kFrameCaps.size()) - 1);
         } else if (key == "show_hitmarkers") {
             settings.show_hitmarkers = value == "1";
+        } else if (key == "audio_master_volume") {
+            settings.audio_master_volume = Saturate(std::stof(value));
+        } else if (key == "audio_weapon_volume") {
+            settings.audio_weapon_volume = Saturate(std::stof(value));
+        } else if (key == "audio_movement_volume") {
+            settings.audio_movement_volume = Saturate(std::stof(value));
         }
     }
 
-    // Migrate pre-v2 configs to the new fullscreen-first startup default.
-    if (!has_version || settings.version < kCurrentSettingsVersion) {
-        settings.version = kCurrentSettingsVersion;
+    const int loaded_version = has_version ? settings.version : 0;
+    if (!has_version || loaded_version < 3) {
         settings.fullscreen = true;
     }
+    settings.version = kCurrentSettingsVersion;
 
     return settings;
 }
@@ -421,6 +458,240 @@ void SaveSettings(const AppPaths& paths, const Settings& settings) {
     file << "fullscreen=" << (settings.fullscreen ? 1 : 0) << "\n";
     file << "frame_cap_index=" << settings.frame_cap_index << "\n";
     file << "show_hitmarkers=" << (settings.show_hitmarkers ? 1 : 0) << "\n";
+    file << "audio_master_volume=" << settings.audio_master_volume << "\n";
+    file << "audio_weapon_volume=" << settings.audio_weapon_volume << "\n";
+    file << "audio_movement_volume=" << settings.audio_movement_volume << "\n";
+}
+
+enum class AudioClipId : size_t {
+    Gunshot = 0,
+    FootstepLeft,
+    FootstepRight,
+    Jump,
+    Crouch,
+    Count,
+};
+
+enum class AudioBus : uint8_t {
+    Weapon,
+    Movement,
+};
+
+struct AudioClip {
+    WAVEFORMATEX format = {};
+    std::vector<int16_t> samples;
+    XAUDIO2_BUFFER buffer = {};
+};
+
+struct ActiveVoice {
+    IXAudio2SourceVoice* voice = nullptr;
+    AudioBus bus = AudioBus::Weapon;
+    float gain = 1.0f;
+};
+
+float RandomSigned(uint32_t& state) {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>((state >> 8) & 0xffffu) / 32767.5f - 1.0f;
+}
+
+AudioClip BuildMonoClip(const std::vector<float>& source, int sample_rate = 44100) {
+    AudioClip clip = {};
+    clip.format.wFormatTag = WAVE_FORMAT_PCM;
+    clip.format.nChannels = 1;
+    clip.format.nSamplesPerSec = sample_rate;
+    clip.format.wBitsPerSample = 16;
+    clip.format.nBlockAlign = static_cast<WORD>(clip.format.nChannels * clip.format.wBitsPerSample / 8);
+    clip.format.nAvgBytesPerSec = clip.format.nSamplesPerSec * clip.format.nBlockAlign;
+    clip.samples.resize(source.size());
+    for (size_t i = 0; i < source.size(); ++i) {
+        clip.samples[i] = static_cast<int16_t>(Clamp(source[i], -1.0f, 1.0f) * 32767.0f);
+    }
+    clip.buffer.AudioBytes = static_cast<UINT32>(clip.samples.size() * sizeof(int16_t));
+    clip.buffer.pAudioData = reinterpret_cast<const BYTE*>(clip.samples.data());
+    clip.buffer.Flags = XAUDIO2_END_OF_STREAM;
+    return clip;
+}
+
+AudioClip BuildGunshotClip() {
+    constexpr int sample_rate = 44100;
+    const int sample_count = static_cast<int>(sample_rate * 0.18f);
+    std::vector<float> samples(static_cast<size_t>(sample_count), 0.0f);
+    uint32_t seed = 0x41434352u;
+    float low_noise = 0.0f;
+    for (int i = 0; i < sample_count; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(sample_rate);
+        const float noise = RandomSigned(seed);
+        low_noise = Lerp(low_noise, noise, 0.08f);
+        const float crack = noise * std::exp(-70.0f * t) * 0.95f;
+        const float body = low_noise * std::exp(-18.0f * t) * 0.38f;
+        const float tone = std::sin(2.0f * kPi * 130.0f * t) * std::exp(-12.0f * t) * 0.30f;
+        const float snap = std::sin(2.0f * kPi * 900.0f * t) * std::exp(-90.0f * t) * 0.18f;
+        samples[static_cast<size_t>(i)] = crack + body + tone + snap;
+    }
+    return BuildMonoClip(samples, sample_rate);
+}
+
+AudioClip BuildFootstepClip(uint32_t seed, float tone_hz) {
+    constexpr int sample_rate = 44100;
+    const int sample_count = static_cast<int>(sample_rate * 0.11f);
+    std::vector<float> samples(static_cast<size_t>(sample_count), 0.0f);
+    float low_noise = 0.0f;
+    for (int i = 0; i < sample_count; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(sample_rate);
+        const float noise = RandomSigned(seed);
+        low_noise = Lerp(low_noise, noise, 0.05f);
+        const float heel = std::sin(2.0f * kPi * tone_hz * t) * std::exp(-26.0f * t) * 0.40f;
+        const float thump = low_noise * std::exp(-17.0f * t) * 0.65f;
+        const float grit = noise * std::exp(-38.0f * t) * 0.12f;
+        samples[static_cast<size_t>(i)] = thump + heel + grit;
+    }
+    return BuildMonoClip(samples, sample_rate);
+}
+
+AudioClip BuildJumpClip() {
+    constexpr int sample_rate = 44100;
+    const int sample_count = static_cast<int>(sample_rate * 0.18f);
+    std::vector<float> samples(static_cast<size_t>(sample_count), 0.0f);
+    uint32_t seed = 0x9a41cc07u;
+    float air = 0.0f;
+    for (int i = 0; i < sample_count; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(sample_rate);
+        const float noise = RandomSigned(seed);
+        air = Lerp(air, noise, 0.22f);
+        const float whoosh = air * std::exp(-12.0f * t) * 0.25f;
+        const float chirp = std::sin(2.0f * kPi * (220.0f + 520.0f * t) * t) * std::exp(-10.0f * t) * 0.22f;
+        const float thump = std::sin(2.0f * kPi * 96.0f * t) * std::exp(-18.0f * t) * 0.22f;
+        samples[static_cast<size_t>(i)] = whoosh + chirp + thump;
+    }
+    return BuildMonoClip(samples, sample_rate);
+}
+
+AudioClip BuildCrouchClip() {
+    constexpr int sample_rate = 44100;
+    const int sample_count = static_cast<int>(sample_rate * 0.10f);
+    std::vector<float> samples(static_cast<size_t>(sample_count), 0.0f);
+    uint32_t seed = 0x71c0ff33u;
+    float rustle = 0.0f;
+    for (int i = 0; i < sample_count; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(sample_rate);
+        const float noise = RandomSigned(seed);
+        rustle = Lerp(rustle, noise, 0.33f);
+        const float cloth = rustle * std::exp(-24.0f * t) * 0.20f;
+        const float tap = std::sin(2.0f * kPi * 78.0f * t) * std::exp(-28.0f * t) * 0.16f;
+        samples[static_cast<size_t>(i)] = cloth + tap;
+    }
+    return BuildMonoClip(samples, sample_rate);
+}
+
+float BusVolume(const Settings& settings, AudioBus bus) {
+    return bus == AudioBus::Weapon ? settings.audio_weapon_volume : settings.audio_movement_volume;
+}
+
+struct AudioEngine {
+    IXAudio2* xaudio = nullptr;
+    IXAudio2MasteringVoice* mastering_voice = nullptr;
+    std::array<AudioClip, static_cast<size_t>(AudioClipId::Count)> clips = {};
+    std::vector<ActiveVoice> active_voices;
+
+    bool Initialize();
+    void Shutdown();
+    void Update(const Settings& settings);
+    void Play(AudioClipId clip_id, AudioBus bus, const Settings& settings, float gain = 1.0f, float pitch = 1.0f);
+    bool IsAvailable() const {
+        return xaudio != nullptr && mastering_voice != nullptr;
+    }
+};
+
+bool AudioEngine::Initialize() {
+    HRESULT hr = XAudio2Create(&xaudio, 0, XAUDIO2_DEFAULT_PROCESSOR);
+    if (FAILED(hr)) {
+        xaudio = nullptr;
+        return false;
+    }
+
+    hr = xaudio->CreateMasteringVoice(&mastering_voice);
+    if (FAILED(hr)) {
+        SafeRelease(xaudio);
+        mastering_voice = nullptr;
+        return false;
+    }
+
+    clips[static_cast<size_t>(AudioClipId::Gunshot)] = BuildGunshotClip();
+    clips[static_cast<size_t>(AudioClipId::FootstepLeft)] = BuildFootstepClip(0x0f00ba11u, 118.0f);
+    clips[static_cast<size_t>(AudioClipId::FootstepRight)] = BuildFootstepClip(0x13572468u, 132.0f);
+    clips[static_cast<size_t>(AudioClipId::Jump)] = BuildJumpClip();
+    clips[static_cast<size_t>(AudioClipId::Crouch)] = BuildCrouchClip();
+    return true;
+}
+
+void AudioEngine::Shutdown() {
+    for (ActiveVoice& active : active_voices) {
+        if (active.voice) {
+            active.voice->Stop(0);
+            active.voice->DestroyVoice();
+            active.voice = nullptr;
+        }
+    }
+    active_voices.clear();
+    if (mastering_voice) {
+        mastering_voice->DestroyVoice();
+        mastering_voice = nullptr;
+    }
+    SafeRelease(xaudio);
+}
+
+void AudioEngine::Update(const Settings& settings) {
+    if (!IsAvailable()) {
+        return;
+    }
+
+    mastering_voice->SetVolume(Saturate(settings.audio_master_volume));
+    for (size_t i = 0; i < active_voices.size();) {
+        ActiveVoice& active = active_voices[i];
+        XAUDIO2_VOICE_STATE state = {};
+        active.voice->GetState(&state);
+        if (state.BuffersQueued == 0) {
+            active.voice->DestroyVoice();
+            active_voices.erase(active_voices.begin() + static_cast<std::ptrdiff_t>(i));
+            continue;
+        }
+        active.voice->SetVolume(active.gain * BusVolume(settings, active.bus));
+        ++i;
+    }
+}
+
+void AudioEngine::Play(AudioClipId clip_id, AudioBus bus, const Settings& settings, float gain, float pitch) {
+    if (!IsAvailable()) {
+        return;
+    }
+
+    const AudioClip& clip = clips[static_cast<size_t>(clip_id)];
+    if (clip.samples.empty()) {
+        return;
+    }
+
+    IXAudio2SourceVoice* voice = nullptr;
+    HRESULT hr = xaudio->CreateSourceVoice(&voice, &clip.format, 0, XAUDIO2_DEFAULT_FREQ_RATIO, nullptr, nullptr, nullptr);
+    if (FAILED(hr) || !voice) {
+        return;
+    }
+
+    XAUDIO2_BUFFER buffer = clip.buffer;
+    buffer.pAudioData = reinterpret_cast<const BYTE*>(clip.samples.data());
+    voice->SetVolume(Saturate(gain) * BusVolume(settings, bus));
+    voice->SetFrequencyRatio(Clamp(pitch, 0.75f, 1.35f));
+    hr = voice->SubmitSourceBuffer(&buffer);
+    if (FAILED(hr)) {
+        voice->DestroyVoice();
+        return;
+    }
+    hr = voice->Start(0);
+    if (FAILED(hr)) {
+        voice->DestroyVoice();
+        return;
+    }
+
+    active_voices.push_back({voice, bus, Saturate(gain)});
 }
 
 struct TelemetryLogger {
@@ -574,6 +845,28 @@ struct DummyState {
     float respawn_time = 0.0f;
 };
 
+struct RenderDummy {
+    uint32_t id = 0;
+    Vec3 position = {};
+    bool alive = false;
+    int health = 200;
+};
+
+struct TraceDummy {
+    uint32_t id = 0;
+    Vec3 position = {};
+    bool alive = false;
+};
+
+struct TraceHit {
+    bool hit = false;
+    bool hit_world = false;
+    bool headshot = false;
+    uint32_t dummy_id = 0;
+    float distance = kMaxShotDistance;
+    Vec3 point = {};
+};
+
 struct InputCommand {
     uint32_t sequence = 0;
     double client_time = 0.0;
@@ -680,6 +973,55 @@ Aabb MakeDummyHeadAabb(const Vec3& position) {
         {position.x - 0.20f, position.y + 1.45f, position.z - 0.20f},
         {position.x + 0.20f, position.y + 1.85f, position.z + 0.20f},
     };
+}
+
+TraceHit ResolveHitscanTrace(const Vec3& origin, const Vec3& dir, const WorldGeometry& world, const TraceDummy* dummies, uint32_t dummy_count) {
+    TraceHit result = {};
+    result.point = origin + dir * kMaxShotDistance;
+
+    float best_t = kMaxShotDistance;
+    for (const Aabb& solid : world.solids) {
+        float solid_t = 0.0f;
+        if (RayIntersectAabb(origin, dir, solid, &solid_t) && solid_t >= 0.0f && solid_t < best_t) {
+            best_t = solid_t;
+            result.hit = true;
+            result.hit_world = true;
+            result.headshot = false;
+            result.dummy_id = 0;
+        }
+    }
+
+    for (uint32_t i = 0; i < dummy_count; ++i) {
+        const TraceDummy& dummy = dummies[i];
+        if (!dummy.alive) {
+            continue;
+        }
+
+        const Aabb head = MakeDummyHeadAabb(dummy.position);
+        const Aabb body = MakeDummyBodyAabb(dummy.position);
+        float head_t = 0.0f;
+        float body_t = 0.0f;
+        const bool hit_head = RayIntersectAabb(origin, dir, head, &head_t);
+        const bool hit_body = RayIntersectAabb(origin, dir, body, &body_t);
+        if (!hit_head && !hit_body) {
+            continue;
+        }
+
+        const float candidate_t = hit_head && (!hit_body || head_t <= body_t) ? head_t : body_t;
+        if (candidate_t < 0.0f || candidate_t >= best_t) {
+            continue;
+        }
+
+        best_t = candidate_t;
+        result.hit = true;
+        result.hit_world = false;
+        result.headshot = hit_head && (!hit_body || head_t <= body_t);
+        result.dummy_id = dummy.id;
+    }
+
+    result.distance = best_t;
+    result.point = origin + dir * best_t;
+    return result;
 }
 
 bool CanStandAt(const Vec3& position, const WorldGeometry& world) {
@@ -907,44 +1249,31 @@ struct ShotResolution {
 };
 
 ShotResolution ResolveServerShot(PlayerState& state, const InputCommand& input, const DummyHistoryFrame& history_frame,
-    std::vector<DummyState>& dummies) {
+    const WorldGeometry& world, std::vector<DummyState>& dummies) {
     ShotResolution resolution = {};
     resolution.fired = true;
 
     const Vec3 origin = state.position + Vec3{0.0f, EyeHeight(state.crouched), 0.0f};
     const Vec3 ray_dir = ForwardFromAngles(input.yaw, input.pitch);
 
-    float best_t = 10000.0f;
-    DummyState* best_dummy = nullptr;
-    bool best_headshot = false;
+    TraceDummy trace_dummies[kMaxDummies] = {};
     for (uint32_t i = 0; i < history_frame.dummy_count; ++i) {
         const NetDummyState& snapshot_dummy = history_frame.dummies[i];
-        if (!snapshot_dummy.alive) {
-            continue;
-        }
-        const Vec3 dummy_position = {snapshot_dummy.x, snapshot_dummy.y, snapshot_dummy.z};
-        const Aabb head = MakeDummyHeadAabb(dummy_position);
-        const Aabb body = MakeDummyBodyAabb(dummy_position);
+        trace_dummies[i].id = snapshot_dummy.id;
+        trace_dummies[i].position = {snapshot_dummy.x, snapshot_dummy.y, snapshot_dummy.z};
+        trace_dummies[i].alive = snapshot_dummy.alive != 0;
+    }
 
-        float head_t = 0.0f;
-        float body_t = 0.0f;
-        const bool hit_head = RayIntersectAabb(origin, ray_dir, head, &head_t);
-        const bool hit_body = RayIntersectAabb(origin, ray_dir, body, &body_t);
-        if (!hit_head && !hit_body) {
-            continue;
-        }
+    const TraceHit trace = ResolveHitscanTrace(origin, ray_dir, world, trace_dummies, history_frame.dummy_count);
+    if (!trace.hit || trace.hit_world || trace.dummy_id == 0) {
+        return resolution;
+    }
 
-        const float t = hit_head && (!hit_body || head_t <= body_t) ? head_t : body_t;
-        const bool headshot = hit_head && (!hit_body || head_t <= body_t);
-        if (t < best_t) {
-            for (DummyState& dummy : dummies) {
-                if (dummy.id == snapshot_dummy.id) {
-                    best_t = t;
-                    best_dummy = &dummy;
-                    best_headshot = headshot;
-                    break;
-                }
-            }
+    DummyState* best_dummy = nullptr;
+    for (DummyState& dummy : dummies) {
+        if (dummy.id == trace.dummy_id) {
+            best_dummy = &dummy;
+            break;
         }
     }
 
@@ -954,8 +1283,8 @@ ShotResolution ResolveServerShot(PlayerState& state, const InputCommand& input, 
 
     resolution.hit = true;
     resolution.dummy_id = best_dummy->id;
-    resolution.headshot = best_headshot;
-    resolution.damage = best_headshot ? 40 : 20;
+    resolution.headshot = trace.headshot;
+    resolution.damage = trace.headshot ? 40 : 20;
     best_dummy->health -= resolution.damage;
     if (best_dummy->health <= 0) {
         best_dummy->alive = false;
@@ -1143,7 +1472,7 @@ void ServerRuntime::Tick(double now, double dt) {
     if (fired && has_client) {
         const DummyHistoryFrame frame = FindHistoryFrame(history, history_count,
             input_to_use.estimated_server_time > 0.0 ? input_to_use.estimated_server_time : now);
-        const ShotResolution shot = ResolveServerShot(player, input_to_use, frame, dummies);
+        const ShotResolution shot = ResolveServerShot(player, input_to_use, frame, world, dummies);
         if (shot.hit) {
             HitConfirmPacket packet = MakePacket<HitConfirmPacket>(PacketType::HitConfirm);
             packet.input_sequence = input_to_use.sequence;
@@ -1245,6 +1574,8 @@ struct Renderer {
     void Present();
     void PushLine3D(const Vec3& a, const Vec3& b, const Color& color);
     void PushLine2D(float x0, float y0, float x1, float y1, const Color& color);
+    void PushTriangle2D(const Vec2& a, const Vec2& b, const Vec2& c, const Color& color);
+    void PushQuad2D(const Vec2& a, const Vec2& b, const Vec2& c, const Vec2& d, const Color& color);
     void PushRect2D(float x, float y, float w, float h, const Color& color);
     void PushBoxSolid(const Aabb& box, const Color& color);
     void PushBoxWire(const Aabb& box, const Color& color);
@@ -1499,6 +1830,17 @@ void Renderer::PushLine3D(const Vec3& a, const Vec3& b, const Color& color) {
 void Renderer::PushLine2D(float x0, float y0, float x1, float y1, const Color& color) {
     lines_2d.push_back({x0, y0, 0.0f, color.r, color.g, color.b, color.a});
     lines_2d.push_back({x1, y1, 0.0f, color.r, color.g, color.b, color.a});
+}
+
+void Renderer::PushTriangle2D(const Vec2& a, const Vec2& b, const Vec2& c, const Color& color) {
+    triangles_2d.push_back({a.x, a.y, 0.0f, color.r, color.g, color.b, color.a});
+    triangles_2d.push_back({b.x, b.y, 0.0f, color.r, color.g, color.b, color.a});
+    triangles_2d.push_back({c.x, c.y, 0.0f, color.r, color.g, color.b, color.a});
+}
+
+void Renderer::PushQuad2D(const Vec2& a, const Vec2& b, const Vec2& c, const Vec2& d, const Color& color) {
+    PushTriangle2D(a, b, c, color);
+    PushTriangle2D(a, c, d, color);
 }
 
 void Renderer::PushRect2D(float x, float y, float w, float h, const Color& color) {
@@ -1915,11 +2257,20 @@ void PumpPlatformMessages(PlatformState& platform) {
     }
 }
 
-struct RenderDummy {
-    uint32_t id = 0;
+struct TracerFx {
+    Vec3 start = {};
+    Vec3 end = {};
+    double spawn_time = 0.0;
+    double end_time = 0.0;
+    float segment_length = 6.0f;
+    Color color = {1.0f, 0.84f, 0.35f, 1.0f};
+};
+
+struct ImpactFx {
     Vec3 position = {};
-    bool alive = false;
-    int health = 200;
+    double spawn_time = 0.0;
+    double end_time = 0.0;
+    Color color = {1.0f, 0.80f, 0.38f, 1.0f};
 };
 
 struct ClientRuntime {
@@ -1950,6 +2301,24 @@ struct ClientRuntime {
     double smoothed_frame_ms = 0.0;
     std::array<float, 120> frame_graph = {};
     size_t frame_graph_index = 0;
+    std::deque<TracerFx> tracers;
+    std::deque<ImpactFx> impacts;
+    double muzzle_flash_time = 0.0;
+    double weapon_bob_phase = 0.0;
+    float weapon_recoil = 0.0f;
+    float weapon_lift = 0.0f;
+    float weapon_roll = 0.0f;
+    float weapon_sway_x = 0.0f;
+    float weapon_sway_y = 0.0f;
+    float weapon_land_kick = 0.0f;
+    float weapon_crouch_blend = 0.0f;
+    float footstep_distance = 0.0f;
+    bool alternate_footstep = false;
+    bool presentation_initialized = false;
+    bool presentation_last_on_ground = true;
+    bool presentation_last_crouched = false;
+    Vec3 presentation_last_position = {};
+    float presentation_last_velocity_y = 0.0f;
 
     struct PendingPacket {
         double release_time = 0.0;
@@ -1967,9 +2336,13 @@ struct ClientRuntime {
     void ConsumePacket(const void* data, size_t size, double now);
     void HandleSnapshot(const SnapshotPacket& snapshot, double receipt_time);
     void HandleHit(const HitConfirmPacket& hit, double now);
-    void StepPrediction(const InputCommand& input, double dt);
+    bool StepPrediction(const InputCommand& input, double dt);
     InputCommand BuildInput(const PlatformState& platform, float yaw, float pitch);
     void TickSimRate(double now);
+    void UpdatePresentation(double now, double dt, float look_dx, float look_dy, AudioEngine& audio, const Settings& settings);
+    void AddTracer(const Vec3& start, const Vec3& end, double now, const Color& color);
+    void AddImpact(const Vec3& position, double now, const Color& color);
+    void OnPredictedShot(const InputCommand& input, double now, AudioEngine& audio, const Settings& settings);
 };
 
 bool ClientRuntime::Initialize() {
@@ -2143,9 +2516,9 @@ void ClientRuntime::HandleHit(const HitConfirmPacket& hit, double now) {
     }
 }
 
-void ClientRuntime::StepPrediction(const InputCommand& input, double dt) {
+bool ClientRuntime::StepPrediction(const InputCommand& input, double dt) {
     ApplyMovement(predicted_player, input, world, dt);
-    ApplyWeaponPrediction(predicted_player, input, dt);
+    const bool fired = ApplyWeaponPrediction(predicted_player, input, dt);
     PredictionEntry entry = {};
     entry.input = input;
     entry.state = predicted_player;
@@ -2153,6 +2526,125 @@ void ClientRuntime::StepPrediction(const InputCommand& input, double dt) {
     while (history.size() > 512) {
         history.pop_front();
     }
+    return fired;
+}
+
+void ClientRuntime::AddTracer(const Vec3& start, const Vec3& end, double now, const Color& color) {
+    TracerFx tracer = {};
+    tracer.start = start;
+    tracer.end = end;
+    tracer.spawn_time = now;
+    tracer.color = color;
+    const float distance = Length(end - start);
+    tracer.end_time = now + Clamp(distance / 480.0f, 0.03f, 0.10f);
+    tracer.segment_length = Clamp(distance * 0.20f, 2.4f, 7.5f);
+    tracers.push_back(tracer);
+    while (tracers.size() > 16) {
+        tracers.pop_front();
+    }
+}
+
+void ClientRuntime::AddImpact(const Vec3& position, double now, const Color& color) {
+    ImpactFx impact = {};
+    impact.position = position;
+    impact.spawn_time = now;
+    impact.end_time = now + 0.09;
+    impact.color = color;
+    impacts.push_back(impact);
+    while (impacts.size() > 16) {
+        impacts.pop_front();
+    }
+}
+
+void ClientRuntime::OnPredictedShot(const InputCommand& input, double now, AudioEngine& audio, const Settings& settings) {
+    weapon_recoil = std::min(1.35f, weapon_recoil + 1.0f);
+    weapon_lift = std::min(1.0f, weapon_lift + 1.0f);
+    weapon_roll = Clamp(weapon_roll + ((input.sequence & 1u) ? 0.75f : -0.75f), -1.0f, 1.0f);
+    muzzle_flash_time = now + 0.045;
+
+    TraceDummy trace_dummies[kMaxDummies] = {};
+    for (uint32_t i = 0; i < render_dummy_count; ++i) {
+        trace_dummies[i].id = render_dummies[i].id;
+        trace_dummies[i].position = render_dummies[i].position;
+        trace_dummies[i].alive = render_dummies[i].alive;
+    }
+
+    const Vec3 origin = predicted_player.position + Vec3{0.0f, EyeHeight(predicted_player.crouched), 0.0f};
+    const Vec3 ray_dir = ForwardFromAngles(input.yaw, input.pitch);
+    const TraceHit trace = ResolveHitscanTrace(origin, ray_dir, world, trace_dummies, render_dummy_count);
+    const Color tracer_color = trace.hit && !trace.hit_world
+        ? (trace.headshot ? Color{1.0f, 0.68f, 0.34f, 1.0f} : Color{0.36f, 0.96f, 0.86f, 1.0f})
+        : Color{1.0f, 0.86f, 0.40f, 1.0f};
+    AddTracer(origin, trace.point, now, tracer_color);
+    if (trace.hit) {
+        AddImpact(trace.point, now, trace.hit_world ? Color{1.0f, 0.80f, 0.44f, 1.0f} : tracer_color);
+    }
+
+    const float pitch = 0.98f + static_cast<float>(input.sequence % 3u) * 0.02f;
+    audio.Play(AudioClipId::Gunshot, AudioBus::Weapon, settings, 0.95f, pitch);
+}
+
+void ClientRuntime::UpdatePresentation(double now, double dt, float look_dx, float look_dy, AudioEngine& audio, const Settings& settings) {
+    if (!presentation_initialized) {
+        presentation_initialized = true;
+        presentation_last_position = predicted_player.position;
+        presentation_last_velocity_y = predicted_player.velocity.y;
+        presentation_last_on_ground = predicted_player.on_ground;
+        presentation_last_crouched = predicted_player.crouched;
+        weapon_crouch_blend = predicted_player.crouched ? 1.0f : 0.0f;
+        return;
+    }
+
+    const Vec3 frame_delta = predicted_player.position - presentation_last_position;
+    const float horizontal_delta = Length(Vec2{frame_delta.x, frame_delta.z});
+    const float speed = Length(Vec2{predicted_player.velocity.x, predicted_player.velocity.z});
+    if (horizontal_delta > 0.75f) {
+        footstep_distance = 0.0f;
+    }
+
+    weapon_crouch_blend = Lerp(weapon_crouch_blend, predicted_player.crouched ? 1.0f : 0.0f, Saturate(static_cast<float>(dt) * 12.0f));
+    weapon_recoil = Lerp(weapon_recoil, 0.0f, Saturate(static_cast<float>(dt) * 18.0f));
+    weapon_lift = Lerp(weapon_lift, 0.0f, Saturate(static_cast<float>(dt) * 16.0f));
+    weapon_roll = Lerp(weapon_roll, 0.0f, Saturate(static_cast<float>(dt) * 14.0f));
+    weapon_land_kick = Lerp(weapon_land_kick, 0.0f, Saturate(static_cast<float>(dt) * 9.0f));
+    weapon_sway_x = Lerp(weapon_sway_x, Clamp(-look_dx * 0.55f, -12.0f, 12.0f), Saturate(static_cast<float>(dt) * 18.0f));
+    weapon_sway_y = Lerp(weapon_sway_y, Clamp(look_dy * 0.55f, -10.0f, 10.0f), Saturate(static_cast<float>(dt) * 18.0f));
+
+    if (presentation_last_on_ground && !predicted_player.on_ground && predicted_player.velocity.y > 1.0f) {
+        audio.Play(AudioClipId::Jump, AudioBus::Movement, settings, 0.70f, 1.0f);
+    }
+    if (presentation_last_crouched != predicted_player.crouched) {
+        audio.Play(AudioClipId::Crouch, AudioBus::Movement, settings, predicted_player.crouched ? 0.60f : 0.48f,
+            predicted_player.crouched ? 0.98f : 1.08f);
+    }
+    if (!presentation_last_on_ground && predicted_player.on_ground) {
+        weapon_land_kick = std::max(weapon_land_kick, Clamp(-presentation_last_velocity_y / 12.0f, 0.0f, 1.0f));
+    }
+
+    if (predicted_player.on_ground && speed > 1.2f) {
+        footstep_distance += horizontal_delta;
+        const float step_spacing = predicted_player.crouched ? 1.10f : 1.55f;
+        while (footstep_distance >= step_spacing) {
+            footstep_distance -= step_spacing;
+            alternate_footstep = !alternate_footstep;
+            audio.Play(alternate_footstep ? AudioClipId::FootstepLeft : AudioClipId::FootstepRight,
+                AudioBus::Movement, settings, predicted_player.crouched ? 0.44f : 0.56f,
+                predicted_player.crouched ? 0.92f : 1.0f);
+        }
+        weapon_bob_phase += horizontal_delta * (predicted_player.crouched ? 15.0f : 11.0f);
+    }
+
+    while (!tracers.empty() && tracers.front().end_time <= now) {
+        tracers.pop_front();
+    }
+    while (!impacts.empty() && impacts.front().end_time <= now) {
+        impacts.pop_front();
+    }
+
+    presentation_last_position = predicted_player.position;
+    presentation_last_velocity_y = predicted_player.velocity.y;
+    presentation_last_on_ground = predicted_player.on_ground;
+    presentation_last_crouched = predicted_player.crouched;
 }
 
 InputCommand ClientRuntime::BuildInput(const PlatformState& platform, float yaw, float pitch) {
@@ -2201,8 +2693,14 @@ void ClientRuntime::TickSimRate(double now) {
 struct MenuState {
     bool open = false;
     int tab = 0;
-    std::array<int, 3> row = {{0, 0, 0}};
+    std::array<int, 4> row = {{0, 0, 0, 0}};
 };
+
+std::string FormatPercentLabel(float value) {
+    char text[32] = {};
+    std::snprintf(text, sizeof(text), "%.0f%%", Saturate(value) * 100.0f);
+    return text;
+}
 
 void DrawFrameGraph(Renderer& renderer, float x, float y, float w, float h, const std::array<float, 120>& samples, size_t head) {
     renderer.PushRect2D(x, y, w, h, {0.04f, 0.08f, 0.12f, 0.75f});
@@ -2228,7 +2726,7 @@ void DrawSettingsMenu(Renderer& renderer, const MenuState& menu, const Settings&
     renderer.PushRect2D(panel_x, panel_y, panel_w, panel_h, {0.03f, 0.05f, 0.08f, 0.90f});
     renderer.PushRect2D(panel_x + 18.0f, panel_y + 18.0f, 170.0f, panel_h - 36.0f, {0.08f, 0.12f, 0.16f, 0.95f});
 
-    const std::array<const char*, 3> tabs = {{"Mouse", "Video", "Gameplay"}};
+    const std::array<const char*, 4> tabs = {{"Mouse", "Video", "Audio", "Gameplay"}};
     for (int i = 0; i < static_cast<int>(tabs.size()); ++i) {
         const bool active = menu.tab == i;
         renderer.PushRect2D(panel_x + 28.0f, panel_y + 36.0f + i * 46.0f, 150.0f, 34.0f, active ? Color{0.20f, 0.38f, 0.48f, 1.0f} : Color{0.10f, 0.16f, 0.20f, 1.0f});
@@ -2236,7 +2734,7 @@ void DrawSettingsMenu(Renderer& renderer, const MenuState& menu, const Settings&
     }
 
     renderer.PushText(panel_x + 220.0f, panel_y + 32.0f, "SETTINGS", {1.0f, 0.95f, 0.75f, 1.0f});
-    renderer.PushText(panel_x + 220.0f, panel_y + panel_h - 26.0f, "Tab: switch category   Up/Down: select   Left/Right: adjust   Enter: toggle", {0.70f, 0.76f, 0.84f, 1.0f});
+    renderer.PushText(panel_x + 220.0f, panel_y + panel_h - 26.0f, "Tab: switch category   Up/Down: select   Left/Right: adjust   Enter: toggle/apply", {0.70f, 0.76f, 0.84f, 1.0f});
 
     auto draw_row = [&](int row_index, const char* label, const std::string& value) {
         const float row_y = panel_y + 86.0f + row_index * 42.0f;
@@ -2260,19 +2758,24 @@ void DrawSettingsMenu(Renderer& renderer, const MenuState& menu, const Settings&
         draw_row(1, "Resolution", kResolutions[settings.resolution_index].label);
         draw_row(2, "Fullscreen", settings.fullscreen ? "On" : "Off");
         draw_row(3, "Frame Cap", kFrameCapLabels[settings.frame_cap_index]);
+    } else if (menu.tab == 2) {
+        draw_row(0, "Master Volume", FormatPercentLabel(settings.audio_master_volume));
+        draw_row(1, "Weapon SFX", FormatPercentLabel(settings.audio_weapon_volume));
+        draw_row(2, "Movement SFX", FormatPercentLabel(settings.audio_movement_volume));
     } else {
         draw_row(0, "Hitmarkers", settings.show_hitmarkers ? "On" : "Off");
         draw_row(1, "HUD Focus", "Competitive Debug");
         draw_row(2, "Net Delay Toggle", "Use F3 in match");
+        draw_row(3, "Exit Game", "Press Enter");
     }
 }
 
-void HandleMenuInput(MenuState& menu, Settings& settings, PlatformState& platform, const AppPaths& paths) {
+bool HandleMenuInput(MenuState& menu, Settings& settings, PlatformState& platform, const AppPaths& paths) {
     if (KeyPressed(platform, VK_TAB)) {
-        menu.tab = (menu.tab + 1) % 3;
+        menu.tab = (menu.tab + 1) % 4;
     }
 
-    const int max_rows = menu.tab == 0 ? 3 : (menu.tab == 1 ? 4 : 3);
+    const int max_rows = menu.tab == 0 ? 3 : (menu.tab == 1 ? 4 : (menu.tab == 2 ? 3 : 4));
     if (KeyPressed(platform, VK_UP)) {
         menu.row[menu.tab] = (menu.row[menu.tab] + max_rows - 1) % max_rows;
     }
@@ -2312,10 +2815,26 @@ void HandleMenuInput(MenuState& menu, Settings& settings, PlatformState& platfor
             settings.frame_cap_index = std::clamp(settings.frame_cap_index + (right ? 1 : -1), 0, static_cast<int>(kFrameCaps.size()) - 1);
             save();
         }
-    } else if (row == 0 && (left || right || activate)) {
-        settings.show_hitmarkers = !settings.show_hitmarkers;
-        save();
+    } else if (menu.tab == 2) {
+        if (row == 0 && (left || right)) {
+            settings.audio_master_volume = Clamp(settings.audio_master_volume + (right ? 0.05f : -0.05f), 0.0f, 1.0f);
+            save();
+        } else if (row == 1 && (left || right)) {
+            settings.audio_weapon_volume = Clamp(settings.audio_weapon_volume + (right ? 0.05f : -0.05f), 0.0f, 1.0f);
+            save();
+        } else if (row == 2 && (left || right)) {
+            settings.audio_movement_volume = Clamp(settings.audio_movement_volume + (right ? 0.05f : -0.05f), 0.0f, 1.0f);
+            save();
+        }
+    } else {
+        if (row == 0 && (left || right || activate)) {
+            settings.show_hitmarkers = !settings.show_hitmarkers;
+            save();
+        } else if (row == 3 && activate) {
+            return true;
+        }
     }
+    return false;
 }
 
 void DrawDebugHud(Renderer& renderer, const ClientRuntime& client, const ServerDebugStats& server_stats, int width, int height) {
@@ -2344,6 +2863,118 @@ void DrawDebugHud(Renderer& renderer, const ClientRuntime& client, const ServerD
     for (const std::string& log : client.damage_log) {
         renderer.PushText(width - 318.0f, 50.0f + row * 16.0f, log.c_str(), {0.84f, 0.92f, 0.99f, 1.0f});
         ++row;
+    }
+}
+
+Vec2 WeaponPoint(const Vec2& anchor, float scale, float rotation, float x, float y) {
+    return anchor + Rotate({-x * scale, y * scale}, rotation);
+}
+
+void DrawWeaponOutline(Renderer& renderer, const Vec2& a, const Vec2& b, const Vec2& c, const Vec2& d, const Color& color) {
+    renderer.PushLine2D(a.x, a.y, b.x, b.y, color);
+    renderer.PushLine2D(b.x, b.y, c.x, c.y, color);
+    renderer.PushLine2D(c.x, c.y, d.x, d.y, color);
+    renderer.PushLine2D(d.x, d.y, a.x, a.y, color);
+}
+
+void DrawShotEffects(Renderer& renderer, const ClientRuntime& client, double now) {
+    for (const TracerFx& tracer : client.tracers) {
+        const double lifetime = std::max(0.0001, tracer.end_time - tracer.spawn_time);
+        const float t = Saturate(static_cast<float>((now - tracer.spawn_time) / lifetime));
+        const Vec3 delta = tracer.end - tracer.start;
+        const float distance = Length(delta);
+        if (distance <= 0.001f) {
+            continue;
+        }
+
+        const Vec3 dir = delta / distance;
+        const float head_distance = Clamp(t * distance, 0.0f, distance);
+        const float tail_distance = std::max(0.0f, head_distance - tracer.segment_length);
+        const Vec3 a = tracer.start + dir * tail_distance;
+        const Vec3 b = tracer.start + dir * head_distance;
+        Color color = tracer.color;
+        color.a *= 1.0f - t * 0.55f;
+        renderer.PushLine3D(a, b, color);
+    }
+
+    for (const ImpactFx& impact : client.impacts) {
+        const double lifetime = std::max(0.0001, impact.end_time - impact.spawn_time);
+        const float t = Saturate(static_cast<float>((now - impact.spawn_time) / lifetime));
+        const float size = Lerp(0.05f, 0.18f, t);
+        Color color = impact.color;
+        color.a *= 1.0f - t;
+        renderer.PushLine3D(impact.position - Vec3{size, 0.0f, 0.0f}, impact.position + Vec3{size, 0.0f, 0.0f}, color);
+        renderer.PushLine3D(impact.position - Vec3{0.0f, size, 0.0f}, impact.position + Vec3{0.0f, size, 0.0f}, color);
+        renderer.PushLine3D(impact.position - Vec3{0.0f, 0.0f, size}, impact.position + Vec3{0.0f, 0.0f, size}, color);
+    }
+}
+
+void DrawWeaponViewModel(Renderer& renderer, const ClientRuntime& client, int width, int height, double now) {
+    const float bob_x = std::sin(static_cast<float>(client.weapon_bob_phase)) * height * 0.008f;
+    const float bob_y = std::fabs(std::sin(static_cast<float>(client.weapon_bob_phase) * 0.5f)) * height * 0.010f;
+    const float crouch_offset = client.weapon_crouch_blend * height * 0.015f;
+    const float land_offset = client.weapon_land_kick * height * 0.020f;
+    const float recoil_back = client.weapon_recoil * height * 0.018f;
+    const float recoil_drop = client.weapon_lift * height * 0.012f;
+    const Vec2 anchor = {
+        width * 0.72f + bob_x + client.weapon_sway_x - recoil_back,
+        height * 0.765f + bob_y + crouch_offset + land_offset + client.weapon_sway_y + recoil_drop
+    };
+    const float scale = height * 0.225f;
+    const Vec2 aim_target = {width * 0.53f, height * 0.56f};
+    const Vec2 aim_dir = {aim_target.x - anchor.x, aim_target.y - anchor.y};
+    const float rotation = static_cast<float>(std::atan2(aim_dir.y, aim_dir.x) - kPi)
+        + std::sin(static_cast<float>(client.weapon_bob_phase)) * 0.020f
+        + client.weapon_roll * 0.020f
+        - client.weapon_lift * 0.015f;
+
+    const Color shadow = {0.01f, 0.02f, 0.04f, 0.24f};
+    const Color outline = {0.04f, 0.07f, 0.10f, 0.95f};
+    const Color receiver = {0.20f, 0.24f, 0.30f, 0.96f};
+    const Color receiver_light = {0.33f, 0.40f, 0.48f, 0.95f};
+    const Color graphite = {0.10f, 0.13f, 0.18f, 0.98f};
+    const Color accent = {0.16f, 0.90f, 0.84f, 0.95f};
+    const Color hot = {1.0f, 0.66f, 0.34f, 0.92f};
+    const Color glove = {0.28f, 0.19f, 0.14f, 0.95f};
+
+    auto wp = [&](float x, float y) { return WeaponPoint(anchor, scale, rotation, x, y); };
+    auto quad = [&](float ax, float ay, float bx, float by, float cx, float cy, float dx, float dy, const Color& color, bool draw_outline = false) {
+        const Vec2 a = wp(ax, ay);
+        const Vec2 b = wp(bx, by);
+        const Vec2 c = wp(cx, cy);
+        const Vec2 d = wp(dx, dy);
+        renderer.PushQuad2D(a, b, c, d, color);
+        if (draw_outline) {
+            DrawWeaponOutline(renderer, a, b, c, d, outline);
+        }
+    };
+    auto tri = [&](float ax, float ay, float bx, float by, float cx, float cy, const Color& color) {
+        renderer.PushTriangle2D(wp(ax, ay), wp(bx, by), wp(cx, cy), color);
+    };
+
+    quad(-0.82f, 0.20f, -0.50f, -0.02f, -0.08f, 0.28f, -0.44f, 0.48f, shadow);
+    quad(-0.30f, 0.18f, 0.68f, -0.02f, 1.10f, 0.16f, -0.02f, 0.42f, shadow);
+
+    quad(-0.78f, 0.06f, -0.54f, -0.10f, -0.34f, 0.18f, -0.60f, 0.34f, graphite, true);
+    quad(-0.46f, -0.06f, 0.28f, -0.14f, 0.62f, 0.10f, -0.10f, 0.23f, receiver, true);
+    quad(-0.34f, 0.00f, 0.20f, -0.06f, 0.46f, 0.08f, -0.06f, 0.14f, receiver_light);
+    quad(0.28f, -0.02f, 0.90f, -0.08f, 1.02f, 0.00f, 0.40f, 0.05f, graphite, true);
+    quad(0.62f, -0.10f, 0.86f, -0.12f, 0.98f, -0.01f, 0.72f, 0.00f, receiver_light, true);
+    quad(-0.06f, 0.18f, 0.16f, 0.17f, 0.24f, 0.62f, 0.02f, 0.64f, graphite, true);
+    quad(-0.22f, 0.12f, -0.04f, 0.10f, 0.06f, 0.42f, -0.14f, 0.46f, glove, true);
+    quad(0.00f, -0.18f, 0.24f, -0.19f, 0.38f, -0.05f, 0.08f, -0.04f, receiver_light, true);
+    quad(-0.04f, -0.01f, 0.28f, -0.04f, 0.40f, 0.00f, 0.08f, 0.03f, accent);
+    quad(0.12f, 0.01f, 0.24f, 0.00f, 0.30f, 0.08f, 0.18f, 0.09f, hot);
+    tri(-0.66f, 0.16f, -0.46f, 0.06f, -0.50f, 0.28f, receiver_light);
+    tri(0.86f, -0.02f, 1.02f, 0.00f, 0.92f, 0.10f, receiver_light);
+
+    const float flash = Saturate(static_cast<float>((client.muzzle_flash_time - now) / 0.045));
+    if (flash > 0.0f) {
+        const Color flash_outer = {1.0f, 0.92f, 0.58f, flash * 0.78f};
+        const Color flash_core = {1.0f, 0.68f, 0.30f, flash * 0.92f};
+        tri(1.00f, 0.00f, 1.18f + flash * 0.22f, -0.14f, 1.30f + flash * 0.26f, 0.02f, flash_outer);
+        tri(1.00f, 0.00f, 1.30f + flash * 0.28f, 0.02f, 1.16f + flash * 0.20f, 0.18f, flash_core);
+        tri(1.00f, 0.00f, 1.16f + flash * 0.14f, -0.05f, 1.42f + flash * 0.30f, 0.04f, {0.66f, 1.0f, 0.92f, flash * 0.24f});
     }
 }
 
@@ -2495,10 +3126,15 @@ void SleepForFrameCap(double target_frame_seconds, double frame_start) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     SetProcessDPIAware();
     timeBeginPeriod(1);
+    const HRESULT com_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool com_initialized = SUCCEEDED(com_result);
 
     WSADATA wsa_data = {};
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
         MessageBoxW(nullptr, L"Failed to initialize WinSock.", L"Accretion", MB_OK | MB_ICONERROR);
+        if (com_initialized) {
+            CoUninitialize();
+        }
         return 1;
     }
 
@@ -2515,6 +3151,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         MessageBoxW(nullptr, L"Failed to create the main window.", L"Accretion", MB_OK | MB_ICONERROR);
         WSACleanup();
         timeEndPeriod(1);
+        if (com_initialized) {
+            CoUninitialize();
+        }
         return 1;
     }
     RegisterRawInput(hwnd);
@@ -2525,8 +3164,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         DestroyWindow(hwnd);
         WSACleanup();
         timeEndPeriod(1);
+        if (com_initialized) {
+            CoUninitialize();
+        }
         return 1;
     }
+
+    AudioEngine audio = {};
+    audio.Initialize();
 
     ServerDebugStats server_stats = {};
     ServerRuntime server = {};
@@ -2536,6 +3181,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         DestroyWindow(hwnd);
         WSACleanup();
         timeEndPeriod(1);
+        audio.Shutdown();
+        if (com_initialized) {
+            CoUninitialize();
+        }
         return 1;
     }
 
@@ -2543,10 +3192,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     if (!client.Initialize()) {
         MessageBoxW(hwnd, L"Failed to initialize the local client networking.", L"Accretion", MB_OK | MB_ICONERROR);
         server.Shutdown();
+        audio.Shutdown();
         renderer.Shutdown();
         DestroyWindow(hwnd);
         WSACleanup();
         timeEndPeriod(1);
+        if (com_initialized) {
+            CoUninitialize();
+        }
         return 1;
     }
 
@@ -2595,10 +3248,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
 
         if (menu.open) {
             UpdateCursorCapture(platform, false);
-            HandleMenuInput(menu, settings, platform, paths);
+            if (HandleMenuInput(menu, settings, platform, paths)) {
+                platform.running = false;
+                continue;
+            }
         } else {
             UpdateCursorCapture(platform, platform.focused && platform.gameplay_focus);
         }
+        audio.Update(settings);
 
         if (!menu.open && platform.focused && platform.mouse_captured) {
             if (settings.raw_input) {
@@ -2640,7 +3297,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
                 input.yaw = view_yaw;
                 input.pitch = view_pitch;
             }
-            client.StepPrediction(input, kFixedDt);
+            const bool fired = client.StepPrediction(input, kFixedDt);
+            if (fired) {
+                client.OnPredictedShot(input, frame_start, audio, settings);
+            }
             client.TickSimRate(frame_start);
 
             InputPacket packet = MakePacket<InputPacket>(PacketType::Input);
@@ -2670,11 +3330,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
             render_stats_time = frame_start;
             render_frames_this_second = 0;
         }
+        client.UpdatePresentation(frame_start, frame_dt,
+            platform.mouse_captured ? platform.mouse_dx : 0.0f,
+            platform.mouse_captured ? platform.mouse_dy : 0.0f,
+            audio, settings);
 
         renderer.Clear();
         renderer.BeginFrame({0.04f, 0.06f, 0.09f, 1.0f});
         DrawWorld(renderer, server.world, client);
+        DrawShotEffects(renderer, client, frame_start);
         DrawRangeGuide(renderer, client, renderer.width);
+        DrawWeaponViewModel(renderer, client, renderer.width, renderer.height, frame_start);
         DrawDebugHud(renderer, client, server_stats, renderer.width, renderer.height);
         DrawCrosshair(renderer, client, renderer.width, renderer.height, frame_start);
         DrawSettingsMenu(renderer, menu, settings, renderer.width, renderer.height);
@@ -2685,6 +3351,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         if (settings.show_hitmarkers && client.elimination_time > frame_start) {
             renderer.PushText(renderer.width * 0.5f - 18.0f, renderer.height * 0.5f + 28.0f, "ELIM", {1.0f, 0.84f, 0.34f, 1.0f});
         }
+        renderer.PushText(renderer.width - 214.0f, renderer.height - 52.0f, "MERCURY RIFLE", {0.64f, 0.96f, 0.90f, 1.0f});
         char ammo_text[64] = {};
         std::snprintf(ammo_text, sizeof(ammo_text), "%02d / 30", client.predicted_player.weapon.ammo);
         renderer.PushText(renderer.width - 96.0f, renderer.height - 34.0f, ammo_text, {1.0f, 0.96f, 0.78f, 1.0f});
@@ -2715,6 +3382,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
 
     telemetry.LogEvent(NowSeconds(), "session_ended");
     SaveSettings(paths, settings);
+    audio.Shutdown();
     client.Shutdown();
     server.Shutdown();
     renderer.Shutdown();
@@ -2722,5 +3390,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     DestroyWindow(hwnd);
     WSACleanup();
     timeEndPeriod(1);
+    if (com_initialized) {
+        CoUninitialize();
+    }
     return 0;
 }

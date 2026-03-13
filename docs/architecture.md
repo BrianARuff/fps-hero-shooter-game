@@ -38,6 +38,7 @@ Rendering must never alter movement, weapon cadence, hit registration, or collis
   - Snapshot ingestion
   - Reconciliation
   - First-person camera
+  - Client-only weapon viewmodel animation, tracer and impact presentation, and local movement plus weapon audio driven from predicted state
 - `Shared simulation`
   - Movement rules
   - Collision
@@ -66,6 +67,7 @@ Rendering must never alter movement, weapon cadence, hit registration, or collis
   - `1.5 s` reload
   - no ADS
   - no damage falloff yet
+  - traces stop on world cover before dummy hitboxes
 - Movement baseline:
   - Overwatch-like responsiveness
   - jump + crouch in milestone one
@@ -83,6 +85,7 @@ Always keep enough instrumentation to answer these questions quickly:
 
 Runtime telemetry is written to `telemetry/` and should remain lightweight enough for regular local playtests.
 For render verification, the executable can also dump a startup back-buffer image to `telemetry/startup_frame.bmp` when launched with `--capture-startup-frame`.
+Weapon viewmodel motion, tracer streaks, and local audio are presentation-only systems and must stay derived from predicted or authoritative gameplay state instead of feeding gameplay state back into simulation.
 
 ## Documentation Rules
 - Append new shipped features to the ordered list in `README.md`.
@@ -90,6 +93,6 @@ For render verification, the executable can also dump a startup back-buffer imag
 - Update `AGENTS.md` when a workflow becomes recurring.
 
 ## Startup Defaults
-- Settings version `3` defaults to fullscreen-first launch so the initial playtest opens at the active monitor size instead of a smaller bootstrap window.
-- Legacy configs are migrated forward on load so earlier local settings files do not keep forcing the old startup path.
+- Settings version `4` keeps the fullscreen-first default for fresh installs, preserves existing display preferences when migrating newer configs, and seeds first-pass audio mix values for the in-game Audio tab.
+- Legacy configs are migrated forward on load so earlier local settings files do not keep forcing the old startup path or miss newly added audio settings.
 - Gameplay cursor capture is armed on the first click-and-release into the range so startup and menu transitions do not inject an accidental camera turn.

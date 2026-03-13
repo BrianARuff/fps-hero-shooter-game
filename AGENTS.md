@@ -19,8 +19,9 @@
    - Launch `dist/Accretion.exe`
 7. When a change touches rendering, camera transforms, fullscreen startup, or mouse capture, perform a visual startup verification instead of relying only on a process-alive smoke test.
    - Use `dist\Accretion.exe --capture-startup-frame` when you need the renderer to dump a real back-buffer frame to `telemetry/startup_frame.bmp`.
-8. Do not couple physics to render delta time. Movement, combat, collision, and weapon cadence must stay on fixed simulation steps.
-9. Prefer additive docs over tribal knowledge. If you discover a recurring workflow, add it here.
+8. When a change touches audio, run a native playtest on the PC and verify the affected cues trigger in gameplay without clipping, missing playback, or obvious volume imbalance. Use the in-game Audio tab for first-pass tuning before handoff.
+9. Do not couple physics to render delta time. Movement, combat, collision, and weapon cadence must stay on fixed simulation steps.
+10. Prefer additive docs over tribal knowledge. If you discover a recurring workflow, add it here.
 
 ## Current Conventions
 - Project codename: `Project Accretion`
